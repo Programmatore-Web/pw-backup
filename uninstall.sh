@@ -8,10 +8,6 @@ CACHE_DIR="/var/cache/$PROJECT_ID"
 STATE_DIR="/var/lib/$PROJECT_ID"
 BIN_PATH="/usr/local/sbin/$PROJECT_ID"
 UNINSTALL_PATH="/usr/local/sbin/$PROJECT_ID-uninstall"
-SERVICE_PATH="/etc/systemd/system/$PROJECT_ID.service"
-TIMER_PATH="/etc/systemd/system/$PROJECT_ID.timer"
-SERVICE_DROPIN_DIR="$SERVICE_PATH.d"
-TIMER_DROPIN_DIR="$TIMER_PATH.d"
 PURGE=false
 
 log() { printf '%s: %s\n' "$PROJECT_ID" "$*"; }
@@ -28,7 +24,7 @@ Options:
   --help    Show this help.
 
 Without --purge, configuration and secrets under /etc/pw-backup are preserved.
-The Debian restic package and other system packages are never removed.
+The Debian restic package and remote repositories are never removed.
 HELP
 }
 
@@ -42,16 +38,25 @@ esac
 [ "$(id -u)" -eq 0 ] || fail 'run this uninstaller as root'
 command -v systemctl >/dev/null 2>&1 || fail 'systemctl is not available'
 
-log 'stopping and disabling scheduled backups'
-systemctl disable --now "$PROJECT_ID.timer" >/dev/null 2>&1 || true
-systemctl stop "$PROJECT_ID.service" >/dev/null 2>&1 || true
-systemctl disable "$PROJECT_ID.service" >/dev/null 2>&1 || true
+for unit in pw-backup.timer pw-backup-maintenance.timer; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+done
+for unit in pw-backup.service pw-backup-maintenance.service; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+done
 
-log 'removing installed files and systemd customizations'
-rm -f "$BIN_PATH" "$SERVICE_PATH" "$TIMER_PATH"
-rm -rf "$SERVICE_DROPIN_DIR" "$TIMER_DROPIN_DIR"
+rm -f "$BIN_PATH"
+for unit in \
+    pw-backup.service pw-backup.timer \
+    pw-backup-maintenance.service pw-backup-maintenance.timer
+do
+    rm -f "/etc/systemd/system/$unit"
+    rm -rf "/etc/systemd/system/$unit.d"
+done
 find /etc/systemd/system -type l \
-    \( -name "$PROJECT_ID.service" -o -name "$PROJECT_ID.timer" \) \
+    \( -name 'pw-backup.service' -o -name 'pw-backup.timer' \
+       -o -name 'pw-backup-maintenance.service' -o -name 'pw-backup-maintenance.timer' \) \
     -delete 2>/dev/null || true
 rm -rf "$CACHE_DIR" "$STATE_DIR"
 
@@ -63,11 +68,14 @@ else
 fi
 
 systemctl daemon-reload
-systemctl reset-failed "$PROJECT_ID.service" "$PROJECT_ID.timer" >/dev/null 2>&1 || true
+systemctl reset-failed \
+    pw-backup.service pw-backup.timer \
+    pw-backup-maintenance.service pw-backup-maintenance.timer \
+    >/dev/null 2>&1 || true
 rm -f "$UNINSTALL_PATH"
 
 printf '\n%s has been uninstalled.\n' "$PROJECT_NAME"
 if [ "$PURGE" = false ] && [ -e "$CONFIG_DIR" ]; then
     printf 'Preserved: %s\n' "$CONFIG_DIR"
 fi
-printf 'The Debian restic package and its repositories were not modified.\n'
+printf 'The Debian restic package and remote repositories were not modified.\n'
