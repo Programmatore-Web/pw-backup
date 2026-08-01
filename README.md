@@ -12,7 +12,8 @@ PW Backup is independent and is not affiliated with Restic or Debian.
 - any repository supported by Restic
 - logs through the systemd journal
 - no implicit repository initialization
-- no automatic retention, prune, or source deletion
+- optional retention and prune, disabled by default
+- no source deletion
 
 ## Installation
 
@@ -64,6 +65,33 @@ A new repository must be initialized explicitly:
 ```bash
 pw-backup restic init
 ```
+
+## Retention and prune
+
+Retention is disabled by default. Enable it in `/etc/pw-backup/config.env` and set at least one keep value:
+
+```text
+PW_BACKUP_RETENTION_ENABLED=true
+PW_BACKUP_KEEP_DAILY=7
+PW_BACKUP_KEEP_WEEKLY=4
+PW_BACKUP_KEEP_MONTHLY=12
+PW_BACKUP_KEEP_YEARLY=5
+PW_BACKUP_PRUNE=true
+```
+
+Preview the policy without changing the repository:
+
+```bash
+pw-backup retention --dry-run
+```
+
+Apply it manually:
+
+```bash
+pw-backup retention
+```
+
+When retention is enabled, `pw-backup run` applies the policy after a successful backup. Snapshots are grouped by host, paths, and tags. `PW_BACKUP_PRUNE=true` physically removes repository data no longer referenced by any retained snapshot.
 
 ## Schedule
 
