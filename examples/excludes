@@ -1,0 +1,8 @@
+# Add one Restic exclude pattern per line.
+# Empty lines and lines starting with # are ignored.
+#
+# Generic examples:
+# **/.cache
+# **/tmp
+# **/*.tmp
+# **/*.log

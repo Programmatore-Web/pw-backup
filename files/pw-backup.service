@@ -1,0 +1,18 @@
+[Unit]
+Description=PW Backup scheduled Restic backup
+Documentation=https://github.com/Programmatore-Web/pw-backup
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pw-backup/config.env
+ConditionPathExists=/etc/pw-backup/paths
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pw-backup run
+User=root
+Group=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=infinity

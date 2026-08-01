@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  debian:
+    name: Debian 13
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+
+    steps:
+      - name: Prepare Debian test environment
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+            ca-certificates git jq restic shellcheck systemd
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Run backup and restore tests
+        run: ./tests/run.sh
+      - name: Run uninstall and purge tests
+        run: ./tests/uninstall.sh

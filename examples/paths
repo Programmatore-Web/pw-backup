@@ -1,0 +1,8 @@
+# Add one source path or pattern per line.
+# Empty lines and lines starting with # are ignored by Restic.
+#
+# Generic examples:
+# /etc
+# /home
+# /srv/data
+# /var/lib/example-app/exports

@@ -1,0 +1,11 @@
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Never commit real local configuration or secrets
+config.env
+paths
+excludes
+repository-password

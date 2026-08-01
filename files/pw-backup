@@ -1,0 +1,147 @@
+#!/bin/sh
+set -eu
+
+PROGRAM_NAME='pw-backup'
+PROGRAM_VERSION='0.1.0'
+DEFAULT_CONFIG_DIR='/etc/pw-backup'
+
+log() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*"
+}
+
+fail() {
+    printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+show_help() {
+    cat <<'HELP'
+Usage:
+  pw-backup run
+  pw-backup check-config
+  pw-backup restic <arguments...>
+  pw-backup --version
+  pw-backup --help
+
+Commands:
+  run           Run the configured Restic backup.
+  check-config  Validate the local PW Backup configuration.
+  restic        Run Restic with the configured repository environment.
+HELP
+}
+
+is_true() {
+    case "$1" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        0|false|FALSE|no|NO|off|OFF) return 1 ;;
+        *) fail "invalid boolean value: $1" ;;
+    esac
+}
+
+load_config() {
+    CONFIG_DIR=${PW_BACKUP_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}
+    CONFIG_FILE=${PW_BACKUP_CONFIG_FILE:-$CONFIG_DIR/config.env}
+    PATHS_FILE=${PW_BACKUP_PATHS_FILE:-$CONFIG_DIR/paths}
+    EXCLUDES_FILE=${PW_BACKUP_EXCLUDES_FILE:-$CONFIG_DIR/excludes}
+
+    [ -r "$CONFIG_FILE" ] || fail "configuration file is not readable: $CONFIG_FILE"
+
+    owner_uid=$(stat -c '%u' "$CONFIG_FILE")
+    [ "$owner_uid" = '0' ] || fail "configuration file must be owned by root: $CONFIG_FILE"
+
+    if find "$CONFIG_FILE" -perm /022 -print -quit | grep -q .; then
+        fail "configuration file must not be writable by group or others: $CONFIG_FILE"
+    fi
+
+    # The file is trusted local administrator configuration, owned by root and
+    # protected from group/other writes.
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+
+    : "${RESTIC_PASSWORD_FILE:=$CONFIG_DIR/repository-password}"
+    : "${RESTIC_CACHE_DIR:=/var/cache/pw-backup/restic}"
+    : "${PW_BACKUP_TAG:=pw-backup}"
+    : "${PW_BACKUP_HOST:=}"
+    : "${PW_BACKUP_SKIP_IF_UNCHANGED:=true}"
+
+    export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR
+}
+
+check_common_config() {
+    command -v restic >/dev/null 2>&1 || fail 'Restic is not installed'
+    [ -n "${RESTIC_REPOSITORY:-}" ] || fail 'RESTIC_REPOSITORY is empty'
+    [ -r "$RESTIC_PASSWORD_FILE" ] || fail "password file is not readable: $RESTIC_PASSWORD_FILE"
+    [ -s "$RESTIC_PASSWORD_FILE" ] || fail "password file is empty: $RESTIC_PASSWORD_FILE"
+
+    mkdir -p "$RESTIC_CACHE_DIR"
+    chmod 0700 "$RESTIC_CACHE_DIR"
+}
+
+check_backup_config() {
+    check_common_config
+    [ -r "$PATHS_FILE" ] || fail "paths file is not readable: $PATHS_FILE"
+
+    if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$PATHS_FILE"; then
+        fail "paths file does not contain any active source: $PATHS_FILE"
+    fi
+
+    if [ -e "$EXCLUDES_FILE" ] && [ ! -r "$EXCLUDES_FILE" ]; then
+        fail "excludes file is not readable: $EXCLUDES_FILE"
+    fi
+
+    is_true "$PW_BACKUP_SKIP_IF_UNCHANGED" >/dev/null || true
+}
+
+run_backup() {
+    check_backup_config
+
+    set -- backup --files-from "$PATHS_FILE"
+
+    if [ -r "$EXCLUDES_FILE" ]; then
+        set -- "$@" --exclude-file "$EXCLUDES_FILE"
+    fi
+
+    if [ -n "$PW_BACKUP_TAG" ]; then
+        set -- "$@" --tag "$PW_BACKUP_TAG"
+    fi
+
+    if [ -n "$PW_BACKUP_HOST" ]; then
+        set -- "$@" --host "$PW_BACKUP_HOST"
+    fi
+
+    if is_true "$PW_BACKUP_SKIP_IF_UNCHANGED"; then
+        set -- "$@" --skip-if-unchanged
+    fi
+
+    log 'starting Restic backup'
+    exec restic "$@"
+}
+
+command=${1:-run}
+case "$command" in
+    run)
+        load_config
+        run_backup
+        ;;
+    check-config)
+        load_config
+        check_backup_config
+        log 'configuration is valid'
+        ;;
+    restic)
+        shift
+        [ "$#" -gt 0 ] || fail 'missing Restic arguments'
+        load_config
+        check_common_config
+        exec restic "$@"
+        ;;
+    --version|-V|version)
+        printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION"
+        ;;
+    --help|-h|help)
+        show_help
+        ;;
+    *)
+        fail "unknown command: $command"
+        ;;
+esac
