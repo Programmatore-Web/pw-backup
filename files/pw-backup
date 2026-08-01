@@ -2,33 +2,27 @@
 set -eu
 
 PROGRAM_NAME='pw-backup'
-PROGRAM_VERSION='0.1.0'
+PROGRAM_VERSION='0.2.0'
 DEFAULT_CONFIG_DIR='/etc/pw-backup'
 
-log() {
-    printf '%s: %s\n' "$PROGRAM_NAME" "$*"
-}
-
-fail() {
-    printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
-    exit 1
-}
+log() { printf '%s: %s\n' "$PROGRAM_NAME" "$*"; }
+fail() { printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
 
 show_help() {
     cat <<'HELP'
 Usage:
   pw-backup run
-  pw-backup retention [--dry-run]
+  pw-backup maintenance [--dry-run]
   pw-backup check-config
   pw-backup restic <arguments...>
   pw-backup --version
   pw-backup --help
 
 Commands:
-  run           Run the configured Restic backup and optional retention.
-  retention     Apply the configured retention policy without creating a backup.
-  check-config  Validate the local PW Backup configuration.
-  restic        Run Restic with the configured repository environment.
+  run          Run only the configured Restic backup.
+  maintenance  Apply configured retention and optional prune.
+  check-config Validate backup and maintenance configuration.
+  restic       Run Restic with the configured repository environment.
 HELP
 }
 
@@ -43,7 +37,6 @@ is_true() {
 validate_optional_count() {
     name=$1
     value=$2
-
     case "$value" in
         '') return 0 ;;
         *[!0-9]*) fail "$name must be empty or a non-negative integer" ;;
@@ -57,16 +50,11 @@ load_config() {
     EXCLUDES_FILE=${PW_BACKUP_EXCLUDES_FILE:-$CONFIG_DIR/excludes}
 
     [ -r "$CONFIG_FILE" ] || fail "configuration file is not readable: $CONFIG_FILE"
-
-    owner_uid=$(stat -c '%u' "$CONFIG_FILE")
-    [ "$owner_uid" = '0' ] || fail "configuration file must be owned by root: $CONFIG_FILE"
-
+    [ "$(stat -c '%u' "$CONFIG_FILE")" = '0' ] || fail "configuration file must be owned by root: $CONFIG_FILE"
     if find "$CONFIG_FILE" -perm /022 -print -quit | grep -q .; then
         fail "configuration file must not be writable by group or others: $CONFIG_FILE"
     fi
 
-    # The file is trusted local administrator configuration, owned by root and
-    # protected from group/other writes.
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
 
@@ -92,131 +80,73 @@ check_common_config() {
     [ -n "${RESTIC_REPOSITORY:-}" ] || fail 'RESTIC_REPOSITORY is empty'
     [ -r "$RESTIC_PASSWORD_FILE" ] || fail "password file is not readable: $RESTIC_PASSWORD_FILE"
     [ -s "$RESTIC_PASSWORD_FILE" ] || fail "password file is empty: $RESTIC_PASSWORD_FILE"
-
     mkdir -p "$RESTIC_CACHE_DIR"
     chmod 0700 "$RESTIC_CACHE_DIR"
 }
 
-check_retention_config() {
+check_maintenance_config() {
     is_true "$PW_BACKUP_RETENTION_ENABLED" >/dev/null || true
     is_true "$PW_BACKUP_PRUNE" >/dev/null || true
-
     validate_optional_count PW_BACKUP_KEEP_LAST "$PW_BACKUP_KEEP_LAST"
     validate_optional_count PW_BACKUP_KEEP_HOURLY "$PW_BACKUP_KEEP_HOURLY"
     validate_optional_count PW_BACKUP_KEEP_DAILY "$PW_BACKUP_KEEP_DAILY"
     validate_optional_count PW_BACKUP_KEEP_WEEKLY "$PW_BACKUP_KEEP_WEEKLY"
     validate_optional_count PW_BACKUP_KEEP_MONTHLY "$PW_BACKUP_KEEP_MONTHLY"
     validate_optional_count PW_BACKUP_KEEP_YEARLY "$PW_BACKUP_KEEP_YEARLY"
-
-    if is_true "$PW_BACKUP_RETENTION_ENABLED"; then
-        if [ -z "$PW_BACKUP_KEEP_LAST$PW_BACKUP_KEEP_HOURLY$PW_BACKUP_KEEP_DAILY$PW_BACKUP_KEEP_WEEKLY$PW_BACKUP_KEEP_MONTHLY$PW_BACKUP_KEEP_YEARLY" ]; then
-            fail 'retention is enabled but no keep policy is configured'
-        fi
+    if is_true "$PW_BACKUP_RETENTION_ENABLED" &&
+       [ -z "$PW_BACKUP_KEEP_LAST$PW_BACKUP_KEEP_HOURLY$PW_BACKUP_KEEP_DAILY$PW_BACKUP_KEEP_WEEKLY$PW_BACKUP_KEEP_MONTHLY$PW_BACKUP_KEEP_YEARLY" ]; then
+        fail 'retention is enabled but no keep policy is configured'
     fi
 }
 
 check_backup_config() {
     check_common_config
-    check_retention_config
+    check_maintenance_config
     [ -r "$PATHS_FILE" ] || fail "paths file is not readable: $PATHS_FILE"
-
-    if ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$PATHS_FILE"; then
-        fail "paths file does not contain any active source: $PATHS_FILE"
-    fi
-
+    grep -Eq '^[[:space:]]*[^#[:space:]]' "$PATHS_FILE" || fail "paths file does not contain any active source: $PATHS_FILE"
     if [ -e "$EXCLUDES_FILE" ] && [ ! -r "$EXCLUDES_FILE" ]; then
         fail "excludes file is not readable: $EXCLUDES_FILE"
     fi
-
     is_true "$PW_BACKUP_SKIP_IF_UNCHANGED" >/dev/null || true
 }
 
-run_retention() {
+run_backup() {
+    check_backup_config
+    set -- backup --files-from "$PATHS_FILE"
+    [ ! -r "$EXCLUDES_FILE" ] || set -- "$@" --exclude-file "$EXCLUDES_FILE"
+    [ -z "$PW_BACKUP_TAG" ] || set -- "$@" --tag "$PW_BACKUP_TAG"
+    [ -z "$PW_BACKUP_HOST" ] || set -- "$@" --host "$PW_BACKUP_HOST"
+    if is_true "$PW_BACKUP_SKIP_IF_UNCHANGED"; then set -- "$@" --skip-if-unchanged; fi
+    log 'starting Restic backup'
+    exec restic "$@"
+}
+
+run_maintenance() {
     dry_run=${1:-false}
-
     check_common_config
-    check_retention_config
-
+    check_maintenance_config
     if ! is_true "$PW_BACKUP_RETENTION_ENABLED"; then
         log 'retention is disabled'
         return 0
     fi
 
     set -- forget --group-by host,paths,tags
-
-    if [ -n "$PW_BACKUP_HOST" ]; then
-        set -- "$@" --host "$PW_BACKUP_HOST"
-    fi
-
-    if [ -n "$PW_BACKUP_TAG" ]; then
-        set -- "$@" --tag "$PW_BACKUP_TAG"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_LAST" ]; then
-        set -- "$@" --keep-last "$PW_BACKUP_KEEP_LAST"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_HOURLY" ]; then
-        set -- "$@" --keep-hourly "$PW_BACKUP_KEEP_HOURLY"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_DAILY" ]; then
-        set -- "$@" --keep-daily "$PW_BACKUP_KEEP_DAILY"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_WEEKLY" ]; then
-        set -- "$@" --keep-weekly "$PW_BACKUP_KEEP_WEEKLY"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_MONTHLY" ]; then
-        set -- "$@" --keep-monthly "$PW_BACKUP_KEEP_MONTHLY"
-    fi
-
-    if [ -n "$PW_BACKUP_KEEP_YEARLY" ]; then
-        set -- "$@" --keep-yearly "$PW_BACKUP_KEEP_YEARLY"
-    fi
-
-    if is_true "$PW_BACKUP_PRUNE"; then
-        set -- "$@" --prune
-    fi
-
+    [ -z "$PW_BACKUP_HOST" ] || set -- "$@" --host "$PW_BACKUP_HOST"
+    [ -z "$PW_BACKUP_TAG" ] || set -- "$@" --tag "$PW_BACKUP_TAG"
+    [ -z "$PW_BACKUP_KEEP_LAST" ] || set -- "$@" --keep-last "$PW_BACKUP_KEEP_LAST"
+    [ -z "$PW_BACKUP_KEEP_HOURLY" ] || set -- "$@" --keep-hourly "$PW_BACKUP_KEEP_HOURLY"
+    [ -z "$PW_BACKUP_KEEP_DAILY" ] || set -- "$@" --keep-daily "$PW_BACKUP_KEEP_DAILY"
+    [ -z "$PW_BACKUP_KEEP_WEEKLY" ] || set -- "$@" --keep-weekly "$PW_BACKUP_KEEP_WEEKLY"
+    [ -z "$PW_BACKUP_KEEP_MONTHLY" ] || set -- "$@" --keep-monthly "$PW_BACKUP_KEEP_MONTHLY"
+    [ -z "$PW_BACKUP_KEEP_YEARLY" ] || set -- "$@" --keep-yearly "$PW_BACKUP_KEEP_YEARLY"
+    if is_true "$PW_BACKUP_PRUNE"; then set -- "$@" --prune; fi
     if is_true "$dry_run"; then
         set -- "$@" --dry-run
-        log 'previewing Restic retention policy'
+        log 'previewing Restic maintenance policy'
     else
-        log 'applying Restic retention policy'
+        log 'applying Restic maintenance policy'
     fi
-
-    restic "$@"
-}
-
-run_backup() {
-    check_backup_config
-
-    set -- backup --files-from "$PATHS_FILE"
-
-    if [ -r "$EXCLUDES_FILE" ]; then
-        set -- "$@" --exclude-file "$EXCLUDES_FILE"
-    fi
-
-    if [ -n "$PW_BACKUP_TAG" ]; then
-        set -- "$@" --tag "$PW_BACKUP_TAG"
-    fi
-
-    if [ -n "$PW_BACKUP_HOST" ]; then
-        set -- "$@" --host "$PW_BACKUP_HOST"
-    fi
-
-    if is_true "$PW_BACKUP_SKIP_IF_UNCHANGED"; then
-        set -- "$@" --skip-if-unchanged
-    fi
-
-    log 'starting Restic backup'
-    restic "$@"
-
-    if is_true "$PW_BACKUP_RETENTION_ENABLED"; then
-        run_retention false
-    fi
+    exec restic "$@"
 }
 
 command=${1:-run}
@@ -226,16 +156,16 @@ case "$command" in
         load_config
         run_backup
         ;;
-    retention)
+    maintenance|retention)
         shift
         case "${1:-}" in
             '') dry_run=false ;;
             --dry-run) dry_run=true; shift ;;
-            *) fail 'usage: pw-backup retention [--dry-run]' ;;
+            *) fail 'usage: pw-backup maintenance [--dry-run]' ;;
         esac
-        [ "$#" -eq 0 ] || fail 'usage: pw-backup retention [--dry-run]'
+        [ "$#" -eq 0 ] || fail 'usage: pw-backup maintenance [--dry-run]'
         load_config
-        run_retention "$dry_run"
+        run_maintenance "$dry_run"
         ;;
     check-config)
         [ "$#" -eq 1 ] || fail 'check-config does not accept arguments'
@@ -250,13 +180,7 @@ case "$command" in
         check_common_config
         exec restic "$@"
         ;;
-    --version|-V|version)
-        printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION"
-        ;;
-    --help|-h|help)
-        show_help
-        ;;
-    *)
-        fail "unknown command: $command"
-        ;;
+    --version|-V|version) printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;
+    --help|-h|help) show_help ;;
+    *) fail "unknown command: $command" ;;
 esac
