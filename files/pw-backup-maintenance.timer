@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PW Backup repository maintenance weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=pw-backup-maintenance.service
+
+[Install]
+WantedBy=timers.target
