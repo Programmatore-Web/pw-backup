@@ -9,3 +9,8 @@ config.env
 paths
 excludes
 repository-password
+
+# Public, fictitious group examples
+!examples/groups/documents/config.env
+!examples/groups/documents/paths
+!examples/groups/documents/excludes
