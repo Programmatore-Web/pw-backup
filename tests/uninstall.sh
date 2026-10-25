@@ -12,11 +12,13 @@ cleanup() {
     rm -f /usr/local/sbin/pw-backup /usr/local/sbin/pw-backup-uninstall
     rm -f /etc/systemd/system/pw-backup.service /etc/systemd/system/pw-backup.timer
     rm -f /etc/systemd/system/pw-backup-maintenance.service /etc/systemd/system/pw-backup-maintenance.timer
+    rm -f /etc/systemd/system/pw-backup-recover.service
     rm -f /etc/systemd/system/pw-backup@*.service /etc/systemd/system/pw-backup@*.timer
     find /etc/systemd/system -type l \
         \( -name 'pw-backup.service' -o -name 'pw-backup.timer' \
            -o -name 'pw-backup-maintenance.service' -o -name 'pw-backup-maintenance.timer' \
-           -o -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \) -delete 2>/dev/null || true
+           -o -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \
+           -o -name 'pw-backup-recover.service' \) -delete 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 fail() { printf 'uninstall test failure: %s\n' "$*" >&2; exit 1; }
@@ -51,6 +53,7 @@ export PATH
 [ -x /usr/local/sbin/pw-backup-uninstall ] || fail 'uninstaller was not installed'
 [ -f /etc/systemd/system/pw-backup@.service ] || fail 'group service template was not installed'
 [ -f /etc/systemd/system/pw-backup@.timer ] || fail 'group timer template was not installed'
+[ -f /etc/systemd/system/pw-backup-recover.service ] || fail 'recovery service was not installed'
 if grep -Eq '(^| )(enable|start|restart)( |$)' "$SYSTEMCTL_LOG"; then
     fail 'installer enabled or started a unit automatically'
 fi
@@ -99,6 +102,7 @@ for path in \
     /etc/systemd/system/pw-backup.timer \
     /etc/systemd/system/pw-backup-maintenance.service \
     /etc/systemd/system/pw-backup-maintenance.timer \
+    /etc/systemd/system/pw-backup-recover.service \
     /etc/systemd/system/pw-backup@.service \
     /etc/systemd/system/pw-backup@.timer \
     /etc/systemd/system/pw-backup@documents.service \
@@ -119,6 +123,7 @@ done
 
 grep -Fqx 'disable --now pw-backup.timer' "$SYSTEMCTL_LOG" || fail 'timer was not disabled'
 grep -Fqx 'stop pw-backup.service' "$SYSTEMCTL_LOG" || fail 'service was not stopped'
+grep -Fqx 'stop pw-backup-recover.service' "$SYSTEMCTL_LOG" || fail 'recovery service was not stopped'
 grep -Fqx 'daemon-reload' "$SYSTEMCTL_LOG" || fail 'systemd was not reloaded'
 grep -Fqx 'disable --now pw-backup@documents.timer' "$SYSTEMCTL_LOG" || fail 'enabled group timer was not disabled'
 grep -Fqx 'stop pw-backup@documents.service' "$SYSTEMCTL_LOG" || fail 'on-disk group service was not stopped'
@@ -144,6 +149,7 @@ assert_absent /etc/systemd/system/pw-backup.service
 assert_absent /etc/systemd/system/pw-backup.timer
 assert_absent /etc/systemd/system/pw-backup-maintenance.service
 assert_absent /etc/systemd/system/pw-backup-maintenance.timer
+assert_absent /etc/systemd/system/pw-backup-recover.service
 assert_absent /etc/systemd/system/pw-backup@.service
 assert_absent /etc/systemd/system/pw-backup@.timer
 assert_absent /var/cache/pw-backup

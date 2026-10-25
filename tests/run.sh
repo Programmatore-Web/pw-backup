@@ -14,6 +14,7 @@ cleanup() {
     rm -f /etc/systemd/system/pw-backup.service /etc/systemd/system/pw-backup.timer
     rm -f /etc/systemd/system/pw-backup-maintenance.service /etc/systemd/system/pw-backup-maintenance.timer
     rm -f /etc/systemd/system/pw-backup@.service /etc/systemd/system/pw-backup@.timer
+    rm -f /etc/systemd/system/pw-backup-recover.service
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -52,7 +53,8 @@ for path in \
     /etc/systemd/system/pw-backup-maintenance.service \
     /etc/systemd/system/pw-backup-maintenance.timer \
     /etc/systemd/system/pw-backup@.service \
-    /etc/systemd/system/pw-backup@.timer
+    /etc/systemd/system/pw-backup@.timer \
+    /etc/systemd/system/pw-backup-recover.service
 do
     [ -f "$path" ] || fail "missing installed unit: $path"
 done
@@ -62,12 +64,18 @@ systemd-analyze verify --instance=documents \
     /etc/systemd/system/pw-backup-maintenance.service \
     /etc/systemd/system/pw-backup-maintenance.timer \
     /etc/systemd/system/pw-backup@.service \
-    /etc/systemd/system/pw-backup@.timer
+    /etc/systemd/system/pw-backup@.timer \
+    /etc/systemd/system/pw-backup-recover.service
 if grep -Eq '^[[:space:]]*ConditionPathExists=' /etc/systemd/system/pw-backup@.service; then
     fail 'group service must let the runner validate the selected configuration root'
 fi
 assert_eq '/usr/local/sbin/pw-backup run --group %i' \
     "$(sed -n 's/^ExecStart=//p' /etc/systemd/system/pw-backup@.service)" 'group service runner command'
+assert_eq '/usr/local/sbin/pw-backup recover --group %i' \
+    "$(sed -n 's/^ExecStopPost=//p' /etc/systemd/system/pw-backup@.service)" 'group cleanup command'
+assert_eq '/usr/local/sbin/pw-backup recover' \
+    "$(sed -n 's/^ExecStart=//p' /etc/systemd/system/pw-backup-recover.service)" 'boot recovery command'
+[ ! -e /etc/systemd/system/multi-user.target.wants/pw-backup-recover.service ] || fail 'installer enabled recovery automatically'
 if grep -Eq '(^| )(enable|start|restart)( |$)' "$SYSTEMCTL_LOG"; then
     fail 'installer enabled or started a unit without explicit administrator action'
 fi
@@ -140,5 +148,6 @@ assert_eq 0 "$(printf '%s\n' "$after_snapshots" | jq --argjson before "$before_i
 
 sh "$PROJECT_ROOT/tests/groups.sh"
 sh "$PROJECT_ROOT/tests/locking.sh"
+sh "$PROJECT_ROOT/tests/hooks.sh"
 
 printf '%s\n' 'All PW Backup tests passed.'
