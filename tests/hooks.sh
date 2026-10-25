@@ -268,6 +268,21 @@ for uninstall_option in '' --purge; do
     [ -f "$STATE_PATH/record" ] || fail 'uninstall removed pending state'
 done
 
+# An inspection error must not be mistaken for an empty directory at uninstall.
+TEST_REAL_FIND=$(command -v find)
+export TEST_REAL_FIND
+cat > "$TEST_ROOT/bin/find" <<'FIND'
+#!/bin/sh
+if [ "$1" = /var/lib/pw-backup/pending ] && [ "$2" = -mindepth ]; then exit 1; fi
+exec "$TEST_REAL_FIND" "$@"
+FIND
+chmod 0755 "$TEST_ROOT/bin/find"
+if "$PROJECT_ROOT/uninstall.sh" --purge >"$TEST_ROOT/result.log" 2>&1; then fail 'uninstall accepted unreadable recovery state'; fi
+grep -Fq 'cannot inspect recovery state' "$TEST_ROOT/result.log" || fail 'uninstall ignored inspection failure'
+expect_error 'cannot inspect pending recovery' recover
+[ -f "$STATE_PATH/record" ] || fail 'inspection failure lost pending state'
+rm "$TEST_ROOT/bin/find"
+
 cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/saved-config"
 cp "$TEST_ROOT/post.sh" "$TEST_ROOT/saved-post"
 : > "$EVENTS"

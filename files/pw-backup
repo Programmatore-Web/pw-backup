@@ -208,8 +208,10 @@ check_secure_path() {
     while :; do
         [ ! -L "$secure_path" ] || fail "symlinks are not allowed: $secure_path"
         [ "$(stat -c '%u' "$secure_path")" = 0 ] || fail "path must be owned by root: $secure_path"
-        if [ -n "$(find "$secure_path" -maxdepth 0 -perm /022 -print)" ]; then
-            if [ ! -d "$secure_path" ] || [ -z "$(find "$secure_path" -maxdepth 0 -perm -1000 -print)" ]; then
+        path_writable=$(find "$secure_path" -maxdepth 0 -perm /022 -print) || fail "cannot inspect path permissions: $secure_path"
+        if [ -n "$path_writable" ]; then
+            path_sticky=$(find "$secure_path" -maxdepth 0 -perm -1000 -print) || fail "cannot inspect sticky directory: $secure_path"
+            if [ ! -d "$secure_path" ] || [ -z "$path_sticky" ]; then
                 fail "path is writable by group or others: $secure_path"
             fi
         fi
@@ -275,7 +277,8 @@ read_pending_state() {
     [ -d "$state_path" ] || fail 'pending recovery is not a directory'
     [ "$(stat -c '%a' "$PENDING_DIR")" = 700 ] || fail 'recovery directory must have mode 0700'
     [ "$(stat -c '%a' "$state_path")" = 700 ] || fail 'pending directory must have mode 0700'
-    [ -z "$(find "$state_path" -mindepth 1 -maxdepth 1 ! -name record -print)" ] || fail 'incomplete or ambiguous recovery state'
+    extra_state_entries=$(find "$state_path" -mindepth 1 -maxdepth 1 ! -name record -print) || fail 'cannot inspect recovery state'
+    [ -z "$extra_state_entries" ] || fail 'incomplete or ambiguous recovery state'
     check_secure_path "$state_path/record"
     [ -f "$state_path/record" ] || fail 'missing recovery record'
     [ "$(stat -c '%a' "$state_path/record")" = 600 ] || fail 'recovery record must have mode 0600'
@@ -429,8 +432,9 @@ run_recover() {
     if [ -n "$1" ]; then
         state_context "$1"
         [ -e "$state_path" ] || [ -L "$state_path" ] || return 0
-    elif [ -z "$(find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        return 0
+    else
+        pending_entry=$(find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -print -quit) || fail 'CRITICAL: cannot inspect pending recovery'
+        [ -n "$pending_entry" ] || return 0
     fi
     acquire_lock
     if [ -n "$1" ]; then recover_selected_group "$1"; return; fi

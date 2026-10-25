@@ -51,7 +51,9 @@ flock -w 300 9 || fail 'could not acquire the shared local lock within 300s'
 if [ -L "$STATE_DIR/pending" ]; then fail 'CRITICAL: unsafe recovery state; uninstall refused'; fi
 if [ -e "$STATE_DIR/pending" ]; then
     [ -d "$STATE_DIR/pending" ] || fail 'CRITICAL: invalid recovery state; uninstall refused'
-    [ -z "$(find "$STATE_DIR/pending" -mindepth 1 -maxdepth 1 -print -quit)" ] || \
+    pending_entry=$(find "$STATE_DIR/pending" -mindepth 1 -maxdepth 1 -print -quit) || \
+        fail 'CRITICAL: cannot inspect recovery state; uninstall refused'
+    [ -z "$pending_entry" ] || \
         fail 'CRITICAL: pending recovery must be completed before uninstall, including --purge'
 fi
 
