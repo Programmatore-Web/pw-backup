@@ -72,6 +72,7 @@ PW_BACKUP_SKIP_IF_UNCHANGED=false
 PW_BACKUP_PRE_HOOK='$1'
 PW_BACKUP_POST_HOOK='$2'
 EOF_CONFIG
+    if [ "$#" -ge 3 ]; then printf "PW_BACKUP_EMAIL_TO='%s'\n" "$3" >> "$CONFIG_ROOT/groups/documents/config.env"; fi
     chmod 0600 "$CONFIG_ROOT/groups/documents/config.env"
 }
 start_backup() {
@@ -95,7 +96,7 @@ set -eu
 if [ "$1" = backup ]; then
     printf '%s\n' restic >> "$TEST_HOOK_ROOT/events"
     case "$(cat "$TEST_HOOK_ROOT/restic-mode")" in
-        failed) exit 42 ;;
+        failed) printf '%s\n' 'fictitious-private-restic-output' >&2; exit 42 ;;
         incomplete) exit 3 ;;
         hold)
             trap 'printf "%s\n" stopped > "$TEST_HOOK_ROOT/restic-stopped"' EXIT
@@ -107,11 +108,23 @@ if [ "$1" = backup ]; then
             ;;
     esac
 fi
+case "$1:$(cat "$TEST_HOOK_ROOT/restic-mode")" in
+    forget:forget-failed) exit 43 ;;
+    prune:prune-failed) exit 44 ;;
+esac
 exec "$TEST_REAL_RESTIC" "$@"
 RESTIC
 cat > "$TEST_ROOT/bin/timeout" <<'TIMEOUT'
 #!/bin/sh
 set -eu
+if [ "$1" = --kill-after=5s ]; then
+    [ "$2" = 30s ]
+    if [ "$(cat "$TEST_HOOK_ROOT/mail-mode")" = hold ]; then
+        shift 2
+        exec "$TEST_REAL_TIMEOUT" --kill-after=0.2s 0.2s "$@"
+    fi
+    exec "$TEST_REAL_TIMEOUT" "$@"
+fi
 if [ "$(cat "$TEST_HOOK_ROOT/timeout-mode")" = fast ]; then
     [ "$1" = --kill-after=10s ] && [ "$2" = 300s ]
     shift 2
@@ -125,7 +138,7 @@ TIMEOUT
 [ -f "$state/record" ] || exit 90
 printf '%s|%s|%s|%s\n' "$PW_BACKUP_GROUP" "$PW_BACKUP_HOOK_PHASE" "$PW_BACKUP_BACKUP_STATUS" "$PW_BACKUP_HOOK_MODE" >> "$fixture/events"
 case "$(cat "$fixture/pre-mode")" in
-    failed) exit 21 ;;
+    failed) printf '%s\n' 'fictitious-private-pre-output' >&2; exit 21 ;;
     partial) : > "$fixture/application-changed"; exit 22 ;;
     hold)
         : > "$fixture/pre-entered"
@@ -141,7 +154,7 @@ PRE
 printf '%s|%s|%s|%s\n' "$PW_BACKUP_GROUP" "$PW_BACKUP_HOOK_PHASE" "$PW_BACKUP_BACKUP_STATUS" "$PW_BACKUP_HOOK_MODE" >> "$fixture/events"
 if [ -e "$fixture/restic-entered" ] && [ ! -e "$fixture/restic-stopped" ]; then exit 91; fi
 case "$(cat "$fixture/post-mode")" in
-    failed) exit 23 ;;
+    failed) printf '%s\n' 'fictitious-private-post-output' >&2; exit 23 ;;
     hold)
         : > "$fixture/post-entered"
         while [ ! -e "$fixture/post-release" ]; do sleep 0.05; done
@@ -407,4 +420,252 @@ waiter_pid=''
 assert_eq 2 "$(grep -cx restic "$EVENTS")" 'competing group ran after POST'
 assert_no_state
 
+# Email tests use only this fixture, never a system MTA or an external address.
+{
+    printf '#!/bin/sh\nset -eu\nfixture=%s\n' "'$TEST_ROOT'"
+    cat <<'SENDMAIL'
+[ "${RESTIC_REPOSITORY+x}" != x ] || exit 92
+[ "$*" = '-t -i' ] || exit 93
+count=$(cat "$fixture/mail-count")
+count=$((count + 1))
+printf '%s\n' "$count" > "$fixture/mail-count"
+cat > "$fixture/message-$count"
+printf '%s\n' mail >> "$fixture/events"
+case "$(cat "$fixture/mail-mode")" in
+    failed) exit 67 ;;
+    hold) sleep 60 ;;
+esac
+SENDMAIL
+} > "$TEST_ROOT/bin/sendmail"
+chmod 0755 "$TEST_ROOT/bin/sendmail"
+reset_mail() {
+    reset_case
+    rm -f "$TEST_ROOT"/message-*
+    printf '%s\n' 0 > "$TEST_ROOT/mail-count"
+    printf '%s\n' success > "$TEST_ROOT/mail-mode"
+}
+assert_mail() {
+    assert_eq "$1" "$(cat "$TEST_ROOT/mail-count")" 'number of email submissions'
+    mail_message="$TEST_ROOT/message-$1"
+    grep -Fxq "Severity: $2" "$mail_message" || fail 'wrong email severity'
+    grep -Fxq "Operation: $3" "$mail_message" || fail 'wrong email operation'
+    grep -Fxq "Group: $4" "$mail_message" || fail 'wrong email group'
+    grep -Fxq "To: $5" "$mail_message" || fail 'wrong email recipient'
+    grep -Fxq "Exit code: $6" "$mail_message" || fail 'wrong email exit code'
+    if grep -Eq 'fictitious-private|fictitious-hook-test-password|RESTIC_|repository|/tmp/|Bcc:' "$mail_message"; then
+        fail 'email leaked private values or injected content'
+    fi
+}
+
+reset_mail
+write_config '' ''
+printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+expect_status 42 run --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'absent email setting'
+write_config '' '' ''
+expect_status 42 run --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'empty email setting'
+PW_BACKUP_EMAIL_TO=ambient@example.invalid expect_status 42 run --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'groups must not inherit recipients'
+
+for recipient in 'alerts@example.invalid' 'backup+alerts@example.invalid'; do
+    write_config '' '' "$recipient"
+    expect_status 0 check-config --group documents
+done
+for recipient in 'bad' 'a@@example.invalid' 'a b@example.invalid' 'a@example.invalid,b@example.invalid' \
+    '-option@example.invalid' 'a@example.invalid/secret' "$(printf 'a@example.invalid\nBcc: injected@example.invalid')" \
+    "$(printf 'a@example.invalid\rBcc: injected@example.invalid')" "$(printf 'a@example.invalid\t')" \
+    "$(printf 'a@example.invalid\001')"; do
+    write_config '' '' "$recipient"
+    expect_error 'PW_BACKUP_EMAIL_TO must be a single plain email address' check-config --group documents
+done
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'validation must not send email'
+
+write_config '' '' alerts@example.invalid
+reset_mail
+expect_status 0 run --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'INFO must not send email'
+grep -Fq 'INFO: backup completed' "$TEST_ROOT/result.log" || fail 'missing ordinary success log'
+expect_status 0 check-config --group documents
+expect_status 0 restic --group documents snapshots --json
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'administrative commands sent email'
+for restic_failure in failed incomplete; do
+    reset_mail
+    printf '%s\n' "$restic_failure" > "$TEST_ROOT/restic-mode"
+    if [ "$restic_failure" = failed ]; then expected_restic_exit=42; else expected_restic_exit=3; fi
+    expect_status "$expected_restic_exit" run --group documents
+    assert_mail 1 CRITICAL backup documents alerts@example.invalid "$expected_restic_exit"
+    assert_no_state
+done
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+expect_status 42 restic --group documents backup source
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'explicit Restic passthrough sent email'
+
+# Legacy supports its own recipient; independent groups retain their settings.
+cp "$CONFIG_ROOT/groups/documents/config.env" "$CONFIG_ROOT/config.env"
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+expect_status 42 run
+assert_mail 1 CRITICAL backup legacy alerts@example.invalid 42
+write_config '' '' alerts@example.invalid
+printf "PW_BACKUP_HOST='machine-a\nBcc: injected@example.invalid'\n" >> "$CONFIG_ROOT/groups/documents/config.env"
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+expect_status 42 run --group documents
+assert_mail 1 CRITICAL backup documents alerts@example.invalid 42
+grep -Fxq 'Host: unavailable' "$TEST_ROOT/message-1" || fail 'unsafe host was not normalized'
+
+write_config "$TEST_ROOT/pre.sh" "$TEST_ROOT/post.sh" alerts@example.invalid
+for failed_stage in pre restic; do
+    reset_mail
+    printf '%s\n' failed > "$TEST_ROOT/$failed_stage-mode"
+    if [ "$failed_stage" = pre ]; then stage_exit=21; else stage_exit=42; fi
+    expect_status "$stage_exit" run --group documents
+    assert_mail 1 CRITICAL backup documents alerts@example.invalid "$stage_exit"
+    assert_eq mail "$(tail -n 1 "$EVENTS")" 'notification must follow POST'
+    assert_no_state
+done
+
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+printf '%s\n' failed > "$TEST_ROOT/post-mode"
+expect_status 42 run --group documents
+assert_mail 1 CRITICAL backup documents alerts@example.invalid 42
+grep -Fq 'Restic and POST cleanup failed' "$TEST_ROOT/message-1" || fail 'combined failure was lost'
+[ -f "$STATE_PATH/record" ] || fail 'pending cleanup record missing'
+[ -f "$STATE_PATH/notified" ] || fail 'pending notification flag missing'
+record_sum=$(sha256sum "$STATE_PATH/record")
+expect_status 1 recover --group documents
+SERVICE_RESULT=exit-code expect_status 1 recover --group documents
+assert_eq 1 "$(cat "$TEST_ROOT/mail-count")" 'ExecStopPost/repeated recovery duplicated the alert'
+assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'notification changed the cleanup record'
+printf '%s\n' success > "$TEST_ROOT/post-mode"
+expect_status 0 recover --group documents
+expect_status 0 recover --group documents
+assert_eq 1 "$(cat "$TEST_ROOT/mail-count")" 'successful recovery sent email'
+assert_no_state
+
+# Failed submission leaves the pending record untouched and writes no flag.
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/post-mode"
+printf '%s\n' failed > "$TEST_ROOT/mail-mode"
+expect_status 1 run --group documents
+[ -f "$STATE_PATH/record" ] || fail 'failed email lost recovery state'
+[ ! -e "$STATE_PATH/notified" ] || fail 'failed email created a notification flag'
+record_sum=$(sha256sum "$STATE_PATH/record")
+assert_mail 1 CRITICAL backup documents alerts@example.invalid 1
+grep -Fq 'POST cleanup failed' "$TEST_ROOT/message-1" || fail 'wrong POST-only failure description'
+grep -Fq 'sendmail submission failed (exit code 67)' "$TEST_ROOT/result.log" || fail 'missing sendmail error log'
+printf '%s\n' success > "$TEST_ROOT/mail-mode"
+expect_status 1 recover --group documents
+assert_mail 2 CRITICAL recovery documents alerts@example.invalid 1
+assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'recovery email changed the record'
+expect_status 1 run --group documents
+assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'blocked backup duplicated recovery email'
+cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/email-config-saved"
+printf '%s\n' '# changed while pending' >> "$CONFIG_ROOT/groups/documents/config.env"
+expect_error 'configuration changed' recover --group documents
+assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'changed configuration invented a recipient'
+cp "$TEST_ROOT/email-config-saved" "$CONFIG_ROOT/groups/documents/config.env"
+printf '%s\n' success > "$TEST_ROOT/post-mode"
+expect_status 0 recover
+assert_no_state
+
+write_config '' '' alerts@example.invalid
+for mail_failure in failed hold missing; do
+    reset_mail
+    printf '%s\n' failed > "$TEST_ROOT/restic-mode"
+    printf '%s\n' "$mail_failure" > "$TEST_ROOT/mail-mode"
+    if [ "$mail_failure" = missing ]; then
+        mv "$TEST_ROOT/bin/sendmail" "$TEST_ROOT/sendmail.saved"
+        if command -v sendmail >/dev/null 2>&1; then fail 'missing-MTA test refuses to use a real sendmail'; fi
+    fi
+    expect_status 42 run --group documents
+    if [ "$mail_failure" = missing ]; then
+        mv "$TEST_ROOT/sendmail.saved" "$TEST_ROOT/bin/sendmail"
+        assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'missing MTA was invoked'
+        grep -Fq 'sendmail is unavailable' "$TEST_ROOT/result.log" || fail 'missing absent-MTA log'
+    else
+        assert_eq 1 "$(cat "$TEST_ROOT/mail-count")" 'email failure caused retries'
+        grep -Fq 'sendmail submission failed' "$TEST_ROOT/result.log" || fail 'missing failed-MTA log'
+        if [ "$mail_failure" = hold ]; then
+            grep -Fq 'exit code 124' "$TEST_ROOT/result.log" || fail 'mail timeout was not bounded'
+        fi
+    fi
+    assert_no_state
+done
+
+# Notification-enabled supervision retains the signal exit code too.
+reset_mail
+printf '%s\n' hold > "$TEST_ROOT/restic-mode"
+start_backup
+wait_for "$TEST_ROOT/restic-entered"
+kill -TERM "$runner_pid"
+wait_backup 143
+assert_mail 1 CRITICAL backup documents alerts@example.invalid 143
+assert_no_state
+
+# Scope-specific maintenance and the single prune owner use their recipients.
+mv "$CONFIG_ROOT/groups" "$TEST_ROOT/groups-saved"
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=true' 'PW_BACKUP_KEEP_LAST=1' >> "$CONFIG_ROOT/config.env"
+reset_mail
+printf '%s\n' forget-failed > "$TEST_ROOT/restic-mode"
+expect_status 43 maintenance
+assert_mail 1 CRITICAL maintenance legacy alerts@example.invalid 43
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=false' >> "$CONFIG_ROOT/config.env"
+mv "$TEST_ROOT/groups-saved" "$CONFIG_ROOT/groups"
+write_config '' '' alerts@example.invalid
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=true' 'PW_BACKUP_KEEP_LAST=1' >> "$CONFIG_ROOT/groups/documents/config.env"
+reset_mail
+printf '%s\n' forget-failed > "$TEST_ROOT/restic-mode"
+expect_status 43 maintenance
+assert_mail 1 CRITICAL maintenance documents alerts@example.invalid 43
+cp "$CONFIG_ROOT/groups/documents/config.env" "$CONFIG_ROOT/groups/other/config.env"
+sed -i 's/alerts@example.invalid/other@example.invalid/' "$CONFIG_ROOT/groups/other/config.env"
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=false' >> "$CONFIG_ROOT/groups/documents/config.env"
+reset_mail
+printf '%s\n' forget-failed > "$TEST_ROOT/restic-mode"
+expect_status 43 maintenance --dry-run
+assert_mail 1 CRITICAL maintenance other other@example.invalid 43
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=false' >> "$CONFIG_ROOT/groups/other/config.env"
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=true' 'PW_BACKUP_PRUNE=true' >> "$CONFIG_ROOT/groups/documents/config.env"
+reset_mail
+printf '%s\n' prune-failed > "$TEST_ROOT/restic-mode"
+expect_status 44 maintenance
+assert_mail 1 CRITICAL prune documents alerts@example.invalid 44
+reset_mail
+expect_status 0 maintenance --dry-run
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'successful maintenance sent email'
+
+TEST_REAL_FLOCK=$(command -v flock)
+export TEST_REAL_FLOCK
+cat > "$TEST_ROOT/bin/flock" <<'FLOCK'
+#!/bin/sh
+[ "$1" = -w ] && [ "$2" = 300 ] && [ "$3" = 9 ] || exit 94
+exec "$TEST_REAL_FLOCK" -w 0.2 9
+FLOCK
+chmod 0755 "$TEST_ROOT/bin/flock"
+exec 8>/run/pw-backup/operation.lock
+"$TEST_REAL_FLOCK" 8
+reset_mail
+expect_status 1 run --group documents
+assert_mail 1 WARNING backup documents alerts@example.invalid 1
+printf '%s\n' 'PW_BACKUP_PRUNE=false' >> "$CONFIG_ROOT/groups/documents/config.env"
+printf '%s\n' 'PW_BACKUP_RETENTION_ENABLED=true' >> "$CONFIG_ROOT/groups/other/config.env"
+reset_mail
+expect_status 1 maintenance
+assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'lock timeout did not notify each enabled group'
+grep -Fxq 'To: alerts@example.invalid' "$TEST_ROOT/message-1" || fail 'wrong first maintenance recipient'
+assert_mail 2 WARNING maintenance other other@example.invalid 1
+chmod 0777 "$CONFIG_ROOT/groups"
+reset_mail
+expect_status 1 run --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'unsafe lock lookup executed configuration'
+chmod 0755 "$CONFIG_ROOT/groups"
+"$TEST_REAL_FLOCK" -u 8
+exec 8>&-
+rm "$TEST_ROOT/bin/flock"
+
+printf '%s\n' 'All PW Backup email tests passed (fixture sendmail only).'
 printf '%s\n' 'All PW Backup hook and recovery tests passed (runner processes; no systemd PID 1).'

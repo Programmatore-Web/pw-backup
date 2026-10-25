@@ -100,7 +100,7 @@ PW_BACKUP_PRE_HOOK=/usr/local/libexec/example-pre
 PW_BACKUP_POST_HOOK=/usr/local/libexec/example-post
 ```
 
-Both values are absolute paths to regular executable scripts, invoked directly without shell evaluation. Scripts and all path components must be root-owned and protected against replacement: no symlinks, group/other write permissions, or `.`/`..` path segments. Root-owned sticky directories such as `/tmp` are allowed because their root-owned children cannot be replaced by other users. Configuration paths for hook-enabled groups must meet the same security checks. Leave both settings empty to retain the existing `exec restic` path without recovery records. POST alone is allowed; PRE always requires an idempotent POST.
+Both values are absolute paths to regular executable scripts, invoked directly without shell evaluation. Scripts and all path components must be root-owned and protected against replacement: no symlinks, group/other write permissions, or `.`/`..` path segments. Root-owned sticky directories such as `/tmp` are allowed because their root-owned children cannot be replaced by other users. Every group configuration path meets the same checks before loading. Without hooks or email notifications, the existing `exec restic` path is retained without recovery records. POST alone is allowed; PRE always requires an idempotent POST.
 
 Scripts run synchronously with a clean environment and this single environment-variable contract:
 
@@ -114,7 +114,7 @@ Scripts run synchronously with a clean environment and this single environment-v
 
 PATH is `/usr/sbin:/usr/bin:/sbin:/bin`; scripts must obtain any other context from their own secure files. Each hook has a fixed 300-second timeout, followed by forced termination after a 10-second grace period. Scripts must remain synchronous, avoid detached/background work, and return success only after verifying their work. They must not recursively invoke `pw-backup` while its lock is held.
 
-Before PRE (or backup for a POST-only group), the runner durably publishes a small pending record under `/var/lib/pw-backup/pending`. It contains only a format version, configuration root, group, POST path, POST checksum and group configuration checksum. Directories are root-only `0700`, records `0600`. The record is not shell code. A reserved state directory and an atomic record rename with filesystem synchronization prevent overwrite or silent loss after interruption; an incomplete record is preserved and fails safely.
+Before PRE (or backup for a POST-only group), the runner durably publishes a small pending record under `/var/lib/pw-backup/pending`. It contains a format version, configuration root, group, POST path, POST checksum and group configuration checksum. When email is enabled, version 2 also records the validated recipient and normalized host; version 1 records remain recoverable. Recovery never sources configuration to obtain an email address. Directories are root-only `0700`, records `0600`. The record is not shell code. A reserved state directory and an atomic record rename with filesystem synchronization prevent overwrite or silent loss after interruption; an incomplete record is preserved and fails safely.
 
 The same local lock covers PRE, Restic, POST and recovery. Failed PRE prevents Restic and still attempts POST, including partial PRE failures. Failed/incomplete Restic backups still run POST; Restic exit code 3 remains an error. On catchable signals, the runner terminates and waits for the active process group before attempting cleanup. POST failure is logged as `CRITICAL`, returns failure and preserves the record. A successful POST removes the record durably. Original PRE/Restic exit codes, including 3, are preserved; POST failure after successful backup returns 1. Catchable HUP/INT/TERM use 129/130/143. Hook timeouts normally return 124; failed recovery returns nonzero.
 
@@ -139,6 +139,30 @@ Recovery runs after local filesystems and network availability; group services a
 SIGKILL and sudden power loss cannot run traps. Pending records survive; systemd's service cleanup, a fresh group run, explicit `recover`, or enabled boot recovery can replay POST. Killing only a manually launched runner may leave its child alive and holding the lock: recovery waits rather than overlapping it. Wait for or terminate that child before retrying. Restarting a runner in the tests simulates boot replay; it is not a real reboot or proof of systemd as PID 1.
 
 Hooks never run during `maintenance`, dry-run, `check-config` or Restic passthrough. These commands keep their existing purpose; `check-config` also validates hook paths. Uninstall, including `--purge`, refuses while **any** pending state exists, keeping the runner, configuration and recovery units available.
+
+## Optional email notifications
+
+Set one plain recipient in legacy `config.env` or an independent group configuration:
+
+```sh
+PW_BACKUP_EMAIL_TO=alerts@example.invalid
+```
+
+Missing or empty disables email. Groups never inherit another scope's recipient. A simple ASCII address is required; whitespace, control characters, multiple recipients and header injection are rejected by `check-config` and configuration loading. No SMTP client, credentials or provider settings are included. An administrator may supply an existing sendmail-compatible command in PATH; the installer installs no mail software and adds no units.
+
+| Level | Events | Email |
+| --- | --- | --- |
+| INFO | Successful backup, unchanged content, completed maintenance/recovery | None; ordinary logs only |
+| WARNING | Operation skipped because the shared local lock timed out or failed | When the affected configuration can be read securely |
+| CRITICAL | PRE, Restic (including exit code 3), POST, recovery, maintenance/prune or other operation failures | When a validated recipient is known |
+
+`check-config` and explicit Restic passthrough do not send mail. With email enabled, the runner waits for Restic and preserves its exit code and the shared lock. Hook notifications follow the POST attempt; combined failures generate one summary, retaining the original PRE/Restic code. Maintenance uses the affected scope's recipient, including the prune owner's recipient. Successful skip-if-unchanged is an ordinary Restic success, not a missed backup.
+
+Messages contain only severity, operation, group, normalized host (or `unavailable`), UTC time, error code and a predefined description. They contain no repository URLs, password paths, environment dumps, hook output or full logs. Configuration/state errors that prevent identifying a recipient safely are logged without inventing a recipient; old version 1 recovery records have no stored email context.
+
+Submission uses `sendmail -t -i` with a fixed 30-second timeout and 5-second termination grace, a clean environment and no retries within the invocation. Missing, unconfigured, failing or stalled sendmail is logged and never changes the operation result or cleanup obligation. Acceptance by sendmail does **not** guarantee final delivery.
+
+For a pending cleanup, an empty protected `notified` flag is recorded only after successful submission, suppressing repeat email from `ExecStopPost` or later recovery attempts for that obligation. It is removed with successful cleanup; it contains no message or retry queue. Failed submissions leave recovery state untouched. A crash between submission and recording the flag can duplicate an alert; a crash before submission can omit it. Delivery and continuous monitoring remain external responsibilities.
 
 ## Retention and prune
 
@@ -234,7 +258,7 @@ pw-backup-uninstall --purge
 
 ## Tests
 
-GitHub Actions runs the existing suite on Debian 13, including real Restic snapshots, parent isolation with identical paths, skip-if-unchanged, filtered retention, shared prune, restore, concurrent operations, hooks, durable cleanup/recovery, lock timeout/error/termination handling, and conservative uninstall/purge. It verifies installed systemd units and `ExecStopPost`, and uses a `systemctl` fixture rather than starting services. Timeout tests shorten only real test waits after checking production limits. PRE/POST scripts in tests only manipulate fictitious temporary files. Signal and crash tests exercise real runner processes; boot replay is simulated by starting a fresh runner. No test claims to run systemd as PID 1.
+GitHub Actions runs the existing suite on Debian 13, including real Restic snapshots, parent isolation with identical paths, skip-if-unchanged, filtered retention, shared prune, restore, concurrent operations, hooks, durable cleanup/recovery, lock timeout/error/termination handling, email notifications and conservative uninstall/purge. It verifies installed systemd units and `ExecStopPost`, and uses a `systemctl` fixture rather than starting services. Timeout tests shorten only real test waits after checking production limits. PRE/POST scripts in tests only manipulate fictitious temporary files; email tests use a controlled sendmail fixture and never send real email. Signal and crash tests exercise real runner processes; boot replay is simulated by starting a fresh runner. No test claims to run systemd as PID 1.
 
 Run the complete suite only as root in a disposable Debian container: the tests install and remove `/etc/pw-backup`, program files and units.
 
