@@ -4,6 +4,8 @@ set -eu
 PROGRAM_NAME='pw-backup'
 PROGRAM_VERSION='0.2.0'
 DEFAULT_CONFIG_DIR='/etc/pw-backup'
+CONFIG_ROOT=${PW_BACKUP_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}
+LOCK_DIR='/run/pw-backup'
 
 log() { printf '%s: %s\n' "$PROGRAM_NAME" "$*"; }
 fail() { printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
@@ -11,19 +13,41 @@ fail() { printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
 show_help() {
     cat <<'HELP'
 Usage:
-  pw-backup run
+  pw-backup run [--group <name>]
   pw-backup maintenance [--dry-run]
-  pw-backup check-config
-  pw-backup restic <arguments...>
+  pw-backup check-config [--group <name>]
+  pw-backup restic [--group <name>] <arguments...>
   pw-backup --version
   pw-backup --help
 
 Commands:
   run          Run only the configured Restic backup.
-  maintenance  Apply configured retention and optional prune.
+  maintenance  Apply legacy and group retention and optional prune.
   check-config Validate backup and maintenance configuration.
   restic       Run Restic with the configured repository environment.
 HELP
+}
+
+validate_group() {
+    case "$1" in
+        ''|[!a-z0-9]*|*[!a-z0-9_-]*) fail "invalid group name: $1" ;;
+    esac
+    [ "${#1}" -le 64 ] || fail 'group names must not exceed 64 characters'
+}
+
+acquire_lock() {
+    command -v flock >/dev/null 2>&1 || fail 'flock is not installed'
+    [ ! -L "$LOCK_DIR" ] || fail "lock directory must not be a symlink: $LOCK_DIR"
+    (umask 077; mkdir -p "$LOCK_DIR")
+    [ "$(stat -c '%u' "$LOCK_DIR")" = 0 ] || fail 'lock directory must be owned by root'
+    chmod 0700 "$LOCK_DIR"
+    [ ! -L "$LOCK_DIR/operation.lock" ] || fail 'lock file must not be a symlink'
+    # Keep this descriptor open across all work, including Restic subprocesses.
+    # Never unlink the file: every invocation must lock the same inode.
+    umask 077
+    exec 9>"$LOCK_DIR/operation.lock"
+    log 'waiting for the shared local lock (timeout: 300s)' >&2
+    flock -w 300 9 || fail 'timed out or failed acquiring the shared local lock after 300s'
 }
 
 is_true() {
@@ -44,10 +68,27 @@ validate_optional_count() {
 }
 
 load_config() {
-    CONFIG_DIR=${PW_BACKUP_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}
-    CONFIG_FILE=${PW_BACKUP_CONFIG_FILE:-$CONFIG_DIR/config.env}
-    PATHS_FILE=${PW_BACKUP_PATHS_FILE:-$CONFIG_DIR/paths}
-    EXCLUDES_FILE=${PW_BACKUP_EXCLUDES_FILE:-$CONFIG_DIR/excludes}
+    GROUP_NAME=${1:-}
+    if [ -n "$GROUP_NAME" ]; then
+        validate_group "$GROUP_NAME"
+        CONFIG_DIR="$CONFIG_ROOT/groups/$GROUP_NAME"
+        CONFIG_FILE="$CONFIG_DIR/config.env"
+        PATHS_FILE="$CONFIG_DIR/paths"
+        EXCLUDES_FILE="$CONFIG_DIR/excludes"
+        # Group configuration is self-contained, including when the caller has
+        # exported legacy settings. Maintenance loads each scope in a subshell.
+        unset RESTIC_REPOSITORY RESTIC_REPOSITORY_FILE RESTIC_PASSWORD_FILE \
+            RESTIC_PASSWORD RESTIC_PASSWORD_COMMAND RESTIC_CACHE_DIR RESTIC_HOST \
+            PW_BACKUP_TAG PW_BACKUP_HOST PW_BACKUP_SKIP_IF_UNCHANGED \
+            PW_BACKUP_RETENTION_ENABLED PW_BACKUP_KEEP_LAST PW_BACKUP_KEEP_HOURLY \
+            PW_BACKUP_KEEP_DAILY PW_BACKUP_KEEP_WEEKLY PW_BACKUP_KEEP_MONTHLY \
+            PW_BACKUP_KEEP_YEARLY PW_BACKUP_PRUNE
+    else
+        CONFIG_DIR=$CONFIG_ROOT
+        CONFIG_FILE=${PW_BACKUP_CONFIG_FILE:-$CONFIG_DIR/config.env}
+        PATHS_FILE=${PW_BACKUP_PATHS_FILE:-$CONFIG_DIR/paths}
+        EXCLUDES_FILE=${PW_BACKUP_EXCLUDES_FILE:-$CONFIG_DIR/excludes}
+    fi
 
     [ -r "$CONFIG_FILE" ] || fail "configuration file is not readable: $CONFIG_FILE"
     [ "$(stat -c '%u' "$CONFIG_FILE")" = '0' ] || fail "configuration file must be owned by root: $CONFIG_FILE"
@@ -58,6 +99,15 @@ load_config() {
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
 
+    if [ -n "$GROUP_NAME" ]; then
+        [ "${PW_BACKUP_TAG+x}" != x ] || fail 'PW_BACKUP_TAG is generated for groups; remove it from the group configuration'
+        PW_BACKUP_TAG="pw-backup-group-$GROUP_NAME"
+        case "${PW_BACKUP_HOST:-}" in
+            *[![:space:]]*) ;;
+            *) fail "PW_BACKUP_HOST must be explicit and non-empty for group $GROUP_NAME" ;;
+        esac
+        : "${RESTIC_CACHE_DIR:=/var/cache/pw-backup/groups/$GROUP_NAME}"
+    fi
     : "${RESTIC_PASSWORD_FILE:=$CONFIG_DIR/repository-password}"
     : "${RESTIC_CACHE_DIR:=/var/cache/pw-backup/restic}"
     : "${PW_BACKUP_TAG:=pw-backup}"
@@ -116,6 +166,7 @@ run_backup() {
     [ ! -r "$EXCLUDES_FILE" ] || set -- "$@" --exclude-file "$EXCLUDES_FILE"
     [ -z "$PW_BACKUP_TAG" ] || set -- "$@" --tag "$PW_BACKUP_TAG"
     [ -z "$PW_BACKUP_HOST" ] || set -- "$@" --host "$PW_BACKUP_HOST"
+    [ -z "$GROUP_NAME" ] || set -- "$@" --group-by host,paths,tags
     if is_true "$PW_BACKUP_SKIP_IF_UNCHANGED"; then set -- "$@" --skip-if-unchanged; fi
     log 'starting Restic backup'
     exec restic "$@"
@@ -123,6 +174,7 @@ run_backup() {
 
 run_maintenance() {
     dry_run=${1:-false}
+    include_prune=${2:-true}
     check_common_config
     check_maintenance_config
     if ! is_true "$PW_BACKUP_RETENTION_ENABLED"; then
@@ -139,7 +191,7 @@ run_maintenance() {
     [ -z "$PW_BACKUP_KEEP_WEEKLY" ] || set -- "$@" --keep-weekly "$PW_BACKUP_KEEP_WEEKLY"
     [ -z "$PW_BACKUP_KEEP_MONTHLY" ] || set -- "$@" --keep-monthly "$PW_BACKUP_KEEP_MONTHLY"
     [ -z "$PW_BACKUP_KEEP_YEARLY" ] || set -- "$@" --keep-yearly "$PW_BACKUP_KEEP_YEARLY"
-    if is_true "$PW_BACKUP_PRUNE"; then set -- "$@" --prune; fi
+    if is_true "$PW_BACKUP_PRUNE" && is_true "$include_prune"; then set -- "$@" --prune; fi
     if is_true "$dry_run"; then
         set -- "$@" --dry-run
         log 'previewing Restic maintenance policy'
@@ -149,12 +201,111 @@ run_maintenance() {
     exec restic "$@"
 }
 
+configured_groups() {
+    for group_dir in "$CONFIG_ROOT"/groups/* "$CONFIG_ROOT"/groups/.[!.]* "$CONFIG_ROOT"/groups/..?*; do
+        [ -d "$group_dir" ] || continue
+        group_name=${group_dir##*/}
+        validate_group "$group_name"
+        printf '%s\n' "$group_name"
+    done
+}
+
+check_legacy_group_safety() {
+    # With groups present, an unfiltered legacy policy could select their
+    # snapshots. The generated tag namespace belongs exclusively to groups.
+    case "$PW_BACKUP_HOST" in
+        *[![:space:]]*) ;;
+        *) fail 'legacy retention requires an explicit PW_BACKUP_HOST when groups exist' ;;
+    esac
+    case "$PW_BACKUP_TAG" in
+        ''|*,*|pw-backup-group-*) fail 'legacy retention requires a single, non-group PW_BACKUP_TAG when groups exist' ;;
+    esac
+}
+
+run_all_maintenance() {
+    groups=$(configured_groups)
+    if [ -z "$groups" ]; then
+        load_config
+        run_maintenance "$1"
+        return
+    fi
+
+    # Validate every scope before the first forget, including disabled groups.
+    # Only the small, in-memory list of exact repository strings is shared.
+    prune_repositories='
+'
+    for scope in '' $groups; do
+        prune_repository=$(
+            load_config "$scope"
+            if [ -n "$scope" ]; then
+                check_backup_config
+            else
+                check_maintenance_config
+                if is_true "$PW_BACKUP_RETENTION_ENABLED"; then
+                    check_common_config
+                    check_legacy_group_safety
+                fi
+            fi
+            if is_true "$PW_BACKUP_PRUNE"; then printf '%s' "${RESTIC_REPOSITORY:-}"; fi
+        ) || return 1
+        if [ -n "$prune_repository" ]; then
+            case "$prune_repositories" in
+                *"
+$prune_repository
+"*) fail 'multiple prune owners declare the same RESTIC_REPOSITORY' ;;
+            esac
+            prune_repositories="$prune_repositories$prune_repository
+"
+        fi
+    done
+
+    # Each subprocess starts from the caller's environment, never a previously
+    # loaded legacy/group configuration. The parent keeps the one lock held.
+    for scope in '' $groups; do
+        (
+            load_config "$scope"
+            if is_true "$PW_BACKUP_RETENTION_ENABLED"; then
+                [ -n "$scope" ] || check_legacy_group_safety
+                run_maintenance "$1" false
+            else
+                log "retention is disabled for ${scope:-legacy}"
+            fi
+        )
+    done
+
+    # Reclaim shared repository data only after all forget policies succeed.
+    for scope in '' $groups; do
+        (
+            load_config "$scope"
+            if is_true "$PW_BACKUP_RETENTION_ENABLED" && is_true "$PW_BACKUP_PRUNE"; then
+                if is_true "$1"; then set -- prune --dry-run; else set -- prune; fi
+                log "pruning repository for ${scope:-legacy}"
+                exec restic "$@"
+            fi
+        )
+    done
+}
+
 command=${1:-run}
 case "$command" in
-    run)
-        [ "$#" -eq 1 ] || fail 'run does not accept arguments'
-        load_config
-        run_backup
+    run|check-config)
+        [ "$#" -gt 0 ] || fail "usage: pw-backup $command [--group <name>]"
+        shift
+        selected_group=''
+        if [ "$#" -ne 0 ]; then
+            [ "$#" -eq 2 ] || fail "usage: pw-backup $command [--group <name>]"
+            [ "$1" = --group ] || fail "usage: pw-backup $command [--group <name>]"
+            validate_group "$2"
+            selected_group=$2
+        fi
+        if [ "$command" = run ]; then acquire_lock; fi
+        load_config "$selected_group"
+        if [ "$command" = run ]; then
+            run_backup
+        else
+            check_backup_config
+            log 'configuration is valid'
+        fi
         ;;
     maintenance|retention)
         shift
@@ -164,19 +315,21 @@ case "$command" in
             *) fail 'usage: pw-backup maintenance [--dry-run]' ;;
         esac
         [ "$#" -eq 0 ] || fail 'usage: pw-backup maintenance [--dry-run]'
-        load_config
-        run_maintenance "$dry_run"
-        ;;
-    check-config)
-        [ "$#" -eq 1 ] || fail 'check-config does not accept arguments'
-        load_config
-        check_backup_config
-        log 'configuration is valid'
+        acquire_lock
+        run_all_maintenance "$dry_run"
         ;;
     restic)
         shift
+        selected_group=''
+        if [ "${1:-}" = --group ]; then
+            [ "$#" -ge 2 ] || fail 'usage: pw-backup restic [--group <name>] <arguments...>'
+            validate_group "$2"
+            selected_group=$2
+            shift 2
+        fi
         [ "$#" -gt 0 ] || fail 'missing Restic arguments'
-        load_config
+        acquire_lock
+        load_config "$selected_group"
         check_common_config
         exec restic "$@"
         ;;

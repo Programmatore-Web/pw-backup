@@ -38,6 +38,25 @@ esac
 [ "$(id -u)" -eq 0 ] || fail 'run this uninstaller as root'
 command -v systemctl >/dev/null 2>&1 || fail 'systemctl is not available'
 
+# Include running, disabled, and enabled-on-disk instances. Do not pass wildcards
+# to systemctl disable: they are not expanded there like list-units patterns.
+group_units=$(
+    {
+        systemctl list-units --all --plain --no-legend --no-pager 'pw-backup@*.service' 'pw-backup@*.timer' || true
+        systemctl list-unit-files --no-legend --no-pager 'pw-backup@*.service' 'pw-backup@*.timer' || true
+        find /etc/systemd/system \( -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \) -printf '%f\n'
+    } | awk '$1 ~ /^pw-backup@[a-z0-9][a-z0-9_-]*\.(service|timer)$/ {print $1}' | sort -u
+)
+for unit in $group_units; do
+    case "$unit" in
+        *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;;
+        *.service)
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            ;;
+    esac
+done
+
 for unit in pw-backup.timer pw-backup-maintenance.timer; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
 done
@@ -54,9 +73,16 @@ do
     rm -f "/etc/systemd/system/$unit"
     rm -rf "/etc/systemd/system/$unit.d"
 done
+for path in /etc/systemd/system/pw-backup@*.service /etc/systemd/system/pw-backup@*.timer; do
+    rm -f "$path"
+done
+for path in /etc/systemd/system/pw-backup@*.service.d /etc/systemd/system/pw-backup@*.timer.d; do
+    rm -rf "$path"
+done
 find /etc/systemd/system -type l \
     \( -name 'pw-backup.service' -o -name 'pw-backup.timer' \
-       -o -name 'pw-backup-maintenance.service' -o -name 'pw-backup-maintenance.timer' \) \
+       -o -name 'pw-backup-maintenance.service' -o -name 'pw-backup-maintenance.timer' \
+       -o -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \) \
     -delete 2>/dev/null || true
 rm -rf "$CACHE_DIR" "$STATE_DIR"
 
@@ -72,6 +98,9 @@ systemctl reset-failed \
     pw-backup.service pw-backup.timer \
     pw-backup-maintenance.service pw-backup-maintenance.timer \
     >/dev/null 2>&1 || true
+for unit in $group_units; do
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+done
 rm -f "$UNINSTALL_PATH"
 
 printf '\n%s has been uninstalled.\n' "$PROJECT_NAME"

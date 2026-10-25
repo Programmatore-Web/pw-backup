@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PW Backup daily for group %i
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=pw-backup@%i.service
+
+[Install]
+WantedBy=timers.target
