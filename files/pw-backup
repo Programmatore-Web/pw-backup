@@ -450,18 +450,22 @@ read_pending_state() {
     extra_record_data=''
     if IFS= read -r extra_record_data <&8 || [ -n "$extra_record_data" ]; then fail 'extra data in recovery record'; fi
     exec 8<&-
+    case "$state_post" in /*) ;; *) fail 'invalid recovery POST path' ;; esac
+    case "$state_post_hash$state_config_hash" in *[!0-9a-f]*) fail 'invalid recovery checksum' ;; esac
+    [ "${#state_post_hash}" -eq 64 ] || fail 'invalid recovery POST checksum'
+    [ "${#state_config_hash}" -eq 64 ] || fail 'invalid recovery configuration checksum'
     validate_group "$state_group"
     root_digest=$(printf '%s\n' "$state_root" | sha256sum)
     [ "${state_path##*/}" = "${root_digest%% *}-$state_group" ] || fail 'recovery state identity mismatch'
     case "$state_root" in /*) ;; *) fail 'invalid recovery configuration root' ;; esac
     check_secure_path "$state_root/groups/$state_group/config.env"
-    [ "$(file_digest "$state_root/groups/$state_group/config.env")" = "$state_config_hash" ] || fail 'configuration changed while recovery was pending'
     if [ "$state_version" = 2 ]; then
         email_to=$state_email
         email_host=$state_host
         email_group=$state_group
         email_state=$state_path
     fi
+    [ "$(file_digest "$state_root/groups/$state_group/config.env")" = "$state_config_hash" ] || fail 'configuration changed while recovery was pending'
     check_hook_script "$state_post"
     [ "$(file_digest "$state_post")" = "$state_post_hash" ] || fail 'POST script changed while recovery was pending'
 }

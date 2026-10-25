@@ -566,11 +566,92 @@ assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'blocked backup duplicated recovery
 cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/email-config-saved"
 printf '%s\n' '# changed while pending' >> "$CONFIG_ROOT/groups/documents/config.env"
 expect_error 'configuration changed' recover --group documents
-assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'changed configuration invented a recipient'
+assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'valid notified flag did not suppress changed-configuration alert'
 cp "$TEST_ROOT/email-config-saved" "$CONFIG_ROOT/groups/documents/config.env"
 printf '%s\n' success > "$TEST_ROOT/post-mode"
 expect_status 0 recover
 assert_no_state
+
+# A verified v2 recipient remains usable when application configuration changes.
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/post-mode"
+printf '%s\n' failed > "$TEST_ROOT/mail-mode"
+expect_status 1 run --group documents
+[ ! -e "$STATE_PATH/notified" ] || fail 'failed submission recorded a flag'
+assert_eq 2 "$(sed -n '1p' "$STATE_PATH/record")" 'email recovery record version'
+cp "$STATE_PATH/record" "$TEST_ROOT/email-record-saved"
+cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/email-config-saved"
+printf '%s\n' 'PW_BACKUP_EMAIL_TO=changed@example.invalid' 'PW_BACKUP_HOST=changed-host' >> "$CONFIG_ROOT/groups/documents/config.env"
+reset_mail
+
+# Every failed structural/identity check must precede trusting the recipient.
+for record_failure in incomplete extra version recipient host identity checksum post permissions; do
+    cp "$TEST_ROOT/email-record-saved" "$STATE_PATH/record"
+    chmod 0600 "$STATE_PATH/record"
+    case "$record_failure" in
+        incomplete) sed -i '$d' "$STATE_PATH/record" ;;
+        extra) printf '%s\n' unexpected >> "$STATE_PATH/record" ;;
+        version) sed -i '1s/.*/9/' "$STATE_PATH/record" ;;
+        recipient) sed -i '7s/.*/invalid-recipient/' "$STATE_PATH/record" ;;
+        host) sed -i '8s@.*@/invalid-host@' "$STATE_PATH/record" ;;
+        identity) sed -i '3s/.*/other/' "$STATE_PATH/record" ;;
+        checksum) sed -i '6s/.*/invalid-checksum/' "$STATE_PATH/record" ;;
+        post) sed -i '4s@.*@relative-post@' "$STATE_PATH/record" ;;
+        permissions) chmod 0644 "$STATE_PATH/record" ;;
+    esac
+    record_sum=$(sha256sum "$STATE_PATH/record")
+    : > "$EVENTS"
+    expect_status 1 recover --group documents
+    grep -Fq CRITICAL "$TEST_ROOT/result.log" || fail 'unverified record was not critical'
+    assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" "unverified record sent email: $record_failure"
+    [ ! -s "$EVENTS" ] || fail "unverified record executed POST: $record_failure"
+    assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'unverified record was changed'
+done
+cp "$TEST_ROOT/email-record-saved" "$STATE_PATH/record"
+chmod 0600 "$STATE_PATH/record"
+record_sum=$(sha256sum "$STATE_PATH/record")
+printf '%s\n' failed > "$TEST_ROOT/mail-mode"
+expect_status 1 recover --group documents
+assert_mail 1 CRITICAL recovery documents alerts@example.invalid 1
+grep -Fxq 'Host: machine-a' "$TEST_ROOT/message-1" || fail 'recovery used the changed host'
+grep -Fq 'configuration changed' "$TEST_ROOT/result.log" || fail 'original recovery failure was lost'
+grep -Fq 'sendmail submission failed (exit code 67)' "$TEST_ROOT/result.log" || fail 'sendmail failure was not logged'
+assert_eq mail "$(cat "$EVENTS")" 'changed configuration executed POST'
+[ ! -e "$STATE_PATH/notified" ] || fail 'failed recovery email created a flag'
+assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'failed email changed pending record'
+printf '%s\n' success > "$TEST_ROOT/mail-mode"
+: > "$EVENTS"
+expect_status 1 recover --group documents
+assert_mail 2 CRITICAL recovery documents alerts@example.invalid 1
+assert_eq mail "$(cat "$EVENTS")" 'changed configuration executed POST before successful submission'
+[ -f "$STATE_PATH/notified" ] || fail 'accepted recovery email was not recorded'
+assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'accepted email changed pending record'
+: > "$EVENTS"
+expect_status 1 recover --group documents
+assert_eq 2 "$(cat "$TEST_ROOT/mail-count")" 'changed configuration duplicated recovery email'
+[ ! -s "$EVENTS" ] || fail 'notified recovery ran POST with changed configuration'
+cp "$TEST_ROOT/email-config-saved" "$CONFIG_ROOT/groups/documents/config.env"
+expect_status 0 recover --group documents
+assert_no_state
+
+# Version 1 retains journal-only failure and ordinary successful cleanup.
+write_config "$TEST_ROOT/pre.sh" "$TEST_ROOT/post.sh"
+reset_mail
+printf '%s\n' failed > "$TEST_ROOT/post-mode"
+expect_status 1 run --group documents
+assert_eq 1 "$(sed -n '1p' "$STATE_PATH/record")" 'legacy recovery record version'
+cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/email-config-saved"
+printf '%s\n' '# changed version 1 configuration' >> "$CONFIG_ROOT/groups/documents/config.env"
+record_sum=$(sha256sum "$STATE_PATH/record")
+reset_mail
+expect_status 1 recover --group documents
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'version 1 invented a recipient'
+[ ! -s "$EVENTS" ] || fail 'version 1 ran POST with changed configuration'
+assert_eq "$record_sum" "$(sha256sum "$STATE_PATH/record")" 'version 1 lost pending record'
+cp "$TEST_ROOT/email-config-saved" "$CONFIG_ROOT/groups/documents/config.env"
+expect_status 0 recover --group documents
+assert_no_state
+assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'version 1 cleanup sent email'
 
 write_config '' '' alerts@example.invalid
 for mail_failure in failed hold missing prepare; do
