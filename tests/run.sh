@@ -2,6 +2,7 @@
 set -eu
 
 PROJECT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+[ "$(id -u)" -eq 0 ] || { printf '%s\n' 'run tests as root in a disposable Debian environment' >&2; exit 1; }
 TEST_ROOT=$(mktemp -d)
 SYSTEMCTL_LOG="$TEST_ROOT/systemctl.log"
 ORIGINAL_PATH=$PATH
@@ -12,6 +13,7 @@ cleanup() {
     rm -f /usr/local/sbin/pw-backup /usr/local/sbin/pw-backup-uninstall
     rm -f /etc/systemd/system/pw-backup.service /etc/systemd/system/pw-backup.timer
     rm -f /etc/systemd/system/pw-backup-maintenance.service /etc/systemd/system/pw-backup-maintenance.timer
+    rm -f /etc/systemd/system/pw-backup@.service /etc/systemd/system/pw-backup@.timer
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -27,8 +29,8 @@ for command_name in shellcheck systemd-analyze jq restic; do
 done
 
 cd "$PROJECT_ROOT"
-sh -n install.sh uninstall.sh files/pw-backup tests/run.sh tests/uninstall.sh
-shellcheck install.sh uninstall.sh files/pw-backup tests/run.sh tests/uninstall.sh
+sh -n install.sh uninstall.sh files/pw-backup tests/*.sh
+shellcheck install.sh uninstall.sh files/pw-backup tests/*.sh
 
 mkdir -p "$TEST_ROOT/bin" /run/systemd/system
 cat > "$TEST_ROOT/bin/systemctl" <<'SYSTEMCTL'
@@ -48,15 +50,19 @@ for path in \
     /etc/systemd/system/pw-backup.service \
     /etc/systemd/system/pw-backup.timer \
     /etc/systemd/system/pw-backup-maintenance.service \
-    /etc/systemd/system/pw-backup-maintenance.timer
+    /etc/systemd/system/pw-backup-maintenance.timer \
+    /etc/systemd/system/pw-backup@.service \
+    /etc/systemd/system/pw-backup@.timer
 do
     [ -f "$path" ] || fail "missing installed unit: $path"
 done
-systemd-analyze verify \
+systemd-analyze verify --instance=documents \
     /etc/systemd/system/pw-backup.service \
     /etc/systemd/system/pw-backup.timer \
     /etc/systemd/system/pw-backup-maintenance.service \
-    /etc/systemd/system/pw-backup-maintenance.timer
+    /etc/systemd/system/pw-backup-maintenance.timer \
+    /etc/systemd/system/pw-backup@.service \
+    /etc/systemd/system/pw-backup@.timer
 if grep -Eq '(^| )(enable|start|restart)( |$)' "$SYSTEMCTL_LOG"; then
     fail 'installer enabled or started a unit without explicit administrator action'
 fi
@@ -116,5 +122,8 @@ if PW_BACKUP_CONFIG_DIR="$CONFIG_DIR" pw-backup check-config >"$TEST_ROOT/invali
     fail 'enabled retention without policy unexpectedly validated'
 fi
 grep -Fq 'no keep policy is configured' "$TEST_ROOT/invalid.log" || fail 'missing retention validation message'
+
+sh "$PROJECT_ROOT/tests/groups.sh"
+sh "$PROJECT_ROOT/tests/locking.sh"
 
 printf '%s\n' 'All PW Backup tests passed.'
