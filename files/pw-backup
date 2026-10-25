@@ -7,9 +7,129 @@ DEFAULT_CONFIG_DIR='/etc/pw-backup'
 CONFIG_ROOT=${PW_BACKUP_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}
 LOCK_DIR='/run/pw-backup'
 PENDING_DIR='/var/lib/pw-backup/pending'
+email_to=''
+email_host=unavailable
+email_group=''
+email_operation=''
+email_issue=operation-failed
+email_state=''
 
 log() { printf '%s: %s\n' "$PROGRAM_NAME" "$*"; }
 fail() { printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+valid_recipient() {
+    [ -n "$1" ] || return 0
+    [ "${#1}" -le 254 ] || return 1
+    case "$1" in *[!a-zA-Z0-9._%+@-]*) return 1 ;; esac
+    printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+}
+
+safe_email_host() {
+    case "$1" in ''|*[!a-zA-Z0-9._-]*) printf '%s' unavailable; return ;; esac
+    if [ "${#1}" -le 255 ]; then printf '%s' "$1"; else printf '%s' unavailable; fi
+}
+
+prepare_email() {
+    email_operation=$1
+    email_to=''
+    email_host=unavailable
+    email_group=''
+    email_state=''
+    email_issue=operation-failed
+    operation_status=0
+    trap 'operation_status=$?; notify_result "$operation_status"' EXIT
+}
+
+# Best effort, once per invocation. Never use command output or logs as mail text.
+notify_result() (
+    trap - EXIT
+    trap '' HUP INT TERM
+    email_code=$1
+    if [ "$email_code" -eq 0 ]; then
+        [ -z "$email_to" ] || log "INFO: $email_operation completed" >&2
+        return 0
+    fi
+    case "$email_issue" in
+        lock-timeout) email_level=WARNING; email_description='Operation skipped because the shared local lock was unavailable.' ;;
+        pre-failed) email_level=CRITICAL; email_description='PRE hook failed; backup was not started.' ;;
+        post-failed) email_level=CRITICAL; email_description='POST cleanup failed; recovery remains pending.' ;;
+        pre-post-failed) email_level=CRITICAL; email_description='PRE hook and POST cleanup failed; recovery remains pending.' ;;
+        restic-post-failed) email_level=CRITICAL; email_description='Restic and POST cleanup failed; recovery remains pending.' ;;
+        restic-failed) email_level=CRITICAL; email_description='Restic failed or returned an incomplete result.' ;;
+        recovery-failed) email_level=CRITICAL; email_description='Pending cleanup could not be completed; state preserved.' ;;
+        interrupted) email_level=CRITICAL; email_description='Operation was interrupted.' ;;
+        *) email_level=CRITICAL; email_description='Operation failed before completion.' ;;
+    esac
+    log "$email_level: $email_description (exit code $email_code)" >&2
+    [ -n "$email_to" ] || return 0
+    valid_recipient "$email_to" || { log 'WARNING: email recipient is unavailable' >&2; return 0; }
+    # A successful submission for this cleanup obligation suppresses a repeated
+    # alert from ExecStopPost/recover. This is neither a queue nor a delivery log.
+    if [ -n "$email_state" ] && [ -e "$email_state/notified" ]; then
+        if (check_secure_path "$email_state/notified"; [ -f "$email_state/notified" ] &&
+            [ ! -s "$email_state/notified" ] && [ "$(stat -c '%a' "$email_state/notified")" = 600 ]); then
+            return 0
+        fi
+    fi
+    email_command=$(command -v sendmail) || { log 'WARNING: sendmail is unavailable; email was not submitted' >&2; return 0; }
+    message_operation=$email_operation
+    case "$message_operation" in backup|maintenance|prune|recovery) ;; *) message_operation=operation ;; esac
+    message_group=$email_group
+    case "$message_group" in
+        '') message_group=legacy ;;
+        [!a-z0-9]*|*[!a-z0-9_-]*) message_group=unavailable ;;
+    esac
+    [ "${#message_group}" -le 64 ] || message_group=unavailable
+    message_host=$(safe_email_host "$email_host")
+    case "$email_code" in ''|*[!0-9]*) email_code=1 ;; esac
+    [ "${#email_code}" -le 3 ] || email_code=1
+    email_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    email_status=0
+    {
+        printf 'To: %s\nSubject: [pw-backup] %s %s\n' "$email_to" "$email_level" "$message_operation"
+        printf 'Auto-Submitted: auto-generated\nContent-Type: text/plain; charset=UTF-8\n\n'
+        printf 'Severity: %s\nOperation: %s\nGroup: %s\nHost: %s\nUTC: %s\n' \
+            "$email_level" "$message_operation" "$message_group" "$message_host" "$email_time"
+        printf 'Result: failed\nExit code: %s\n%s\n' "$email_code" "$email_description"
+    } | timeout --kill-after=5s 30s env --default-signal=HUP,INT,TERM -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin "$email_command" -t -i 9>&- >/dev/null 2>&1 || email_status=$?
+    if [ "$email_status" -ne 0 ]; then
+        log "WARNING: sendmail submission failed (exit code $email_status); original result preserved" >&2
+    elif [ -n "$email_state" ] && [ -f "$email_state/record" ]; then
+        (check_secure_path "$email_state"; umask 077; set -C
+            : > "$email_state/notified" && sync -f "$email_state") ||
+            log 'WARNING: could not record email submission; a later alert may repeat' >&2
+    fi
+    return 0
+)
+
+notify_lock_failure() (
+    trap - EXIT
+    case "$email_operation" in
+        backup) set -- "$selected_group" ;;
+        maintenance)
+            email_scopes=$(configured_groups) || exit 0
+            # Identifiers have already been validated; split the group list.
+            # shellcheck disable=SC2086
+            set -- '' $email_scopes
+            ;;
+        recovery) [ -n "${selected_group:-}" ] || exit 0; set -- "$selected_group" ;;
+        *) exit 0 ;;
+    esac
+    # Maintenance may affect several scopes; each lookup has its own context.
+    for email_scope do
+        (
+            # Extra validation for this exceptional lookup, including legacy.
+            if [ -z "$email_scope" ]; then
+                check_secure_path "${PW_BACKUP_CONFIG_FILE:-$CONFIG_ROOT/config.env}"
+            fi
+            load_config "$email_scope"
+            if [ "$email_operation" = maintenance ] && ! is_true "$PW_BACKUP_RETENTION_ENABLED"; then exit 0; fi
+            email_issue=lock-timeout
+            notify_result 1
+        ) || log 'WARNING: lock notification recipient could not be read safely' >&2
+    done
+)
 
 show_help() {
     cat <<'HELP'
@@ -50,7 +170,11 @@ acquire_lock() {
     umask 077
     exec 9>"$LOCK_DIR/operation.lock"
     log 'waiting for the shared local lock (timeout: 300s)' >&2
-    flock -w 300 9 || fail 'timed out or failed acquiring the shared local lock after 300s'
+    flock -w 300 9 || {
+        email_issue=lock-timeout
+        notify_lock_failure
+        fail 'timed out or failed acquiring the shared local lock after 300s'
+    }
 }
 
 is_true() {
@@ -71,6 +195,8 @@ validate_optional_count() {
 }
 
 load_config() {
+    email_to=''
+    email_state=''
     GROUP_NAME=${1:-}
     if [ -n "$GROUP_NAME" ]; then
         validate_group "$GROUP_NAME"
@@ -86,7 +212,7 @@ load_config() {
             PW_BACKUP_RETENTION_ENABLED PW_BACKUP_KEEP_LAST PW_BACKUP_KEEP_HOURLY \
             PW_BACKUP_KEEP_DAILY PW_BACKUP_KEEP_WEEKLY PW_BACKUP_KEEP_MONTHLY \
             PW_BACKUP_KEEP_YEARLY PW_BACKUP_PRUNE \
-            PW_BACKUP_PRE_HOOK PW_BACKUP_POST_HOOK
+            PW_BACKUP_PRE_HOOK PW_BACKUP_POST_HOOK PW_BACKUP_EMAIL_TO
     else
         CONFIG_DIR=$CONFIG_ROOT
         CONFIG_FILE=${PW_BACKUP_CONFIG_FILE:-$CONFIG_DIR/config.env}
@@ -138,6 +264,11 @@ load_config() {
     : "${PW_BACKUP_KEEP_MONTHLY:=}"
     : "${PW_BACKUP_KEEP_YEARLY:=}"
     : "${PW_BACKUP_PRUNE:=false}"
+    : "${PW_BACKUP_EMAIL_TO:=}"
+    valid_recipient "$PW_BACKUP_EMAIL_TO" || fail 'PW_BACKUP_EMAIL_TO must be a single plain email address'
+    email_to=$PW_BACKUP_EMAIL_TO
+    email_group=$GROUP_NAME
+    email_host=$(safe_email_host "$PW_BACKUP_HOST")
 
     export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR
 }
@@ -200,6 +331,7 @@ run_backup() {
     if [ -n "$GROUP_NAME" ] && [ -n "$PW_BACKUP_PRE_HOOK$PW_BACKUP_POST_HOOK" ]; then
         run_hook_backup "$@"
     fi
+    if [ -n "$email_to" ]; then run_notified_restic "$@"; fi
     exec restic "$@"
 }
 
@@ -271,11 +403,16 @@ create_pending_state() {
     (umask 077; mkdir "$state_path") || fail 'pending recovery already exists'
     state_post_hash=$(file_digest "$PW_BACKUP_POST_HOOK")
     state_config_hash=$(file_digest "$state_root/groups/$GROUP_NAME/config.env")
-    (umask 077; printf '%s\n' 1 "$state_root" "$GROUP_NAME" "$PW_BACKUP_POST_HOOK" \
-        "$state_post_hash" "$state_config_hash" > "$state_path/record.tmp") || fail 'cannot write recovery state'
+    (umask 077
+        if [ -n "$email_to" ]; then state_version=2; else state_version=1; fi
+        { printf '%s\n' "$state_version" "$state_root" "$GROUP_NAME" "$PW_BACKUP_POST_HOOK" \
+            "$state_post_hash" "$state_config_hash"
+            [ "$state_version" = 1 ] || printf '%s\n' "$email_to" "$email_host"
+        } > "$state_path/record.tmp") || fail 'cannot write recovery state'
     sync -f "$state_path/record.tmp" || fail 'cannot persist recovery state'
     mv -T -- "$state_path/record.tmp" "$state_path/record" || fail 'cannot publish recovery state'
     sync -f "$PENDING_DIR" || fail 'cannot persist published recovery state'
+    email_state=$state_path
 }
 
 read_pending_state() {
@@ -284,7 +421,7 @@ read_pending_state() {
     [ -d "$state_path" ] || fail 'pending recovery is not a directory'
     [ "$(stat -c '%a' "$PENDING_DIR")" = 700 ] || fail 'recovery directory must have mode 0700'
     [ "$(stat -c '%a' "$state_path")" = 700 ] || fail 'pending directory must have mode 0700'
-    extra_state_entries=$(find "$state_path" -mindepth 1 -maxdepth 1 ! -name record -print) || fail 'cannot inspect recovery state'
+    extra_state_entries=$(find "$state_path" -mindepth 1 -maxdepth 1 ! -name record ! -name notified -print) || fail 'cannot inspect recovery state'
     [ -z "$extra_state_entries" ] || fail 'incomplete or ambiguous recovery state'
     check_secure_path "$state_path/record"
     [ -f "$state_path/record" ] || fail 'missing recovery record'
@@ -295,16 +432,33 @@ read_pending_state() {
         IFS= read -r state_group && IFS= read -r state_post &&
         IFS= read -r state_post_hash && IFS= read -r state_config_hash
     } <&8 || fail 'incomplete recovery record'
+    state_email=''
+    state_host=unavailable
+    case "$state_version" in
+        1) ;;
+        2)
+            { IFS= read -r state_email && IFS= read -r state_host; } <&8 || fail 'incomplete email recovery context'
+            [ -n "$state_email" ] || fail 'empty recovery email recipient'
+            valid_recipient "$state_email" || fail 'invalid recovery email recipient'
+            [ "$(safe_email_host "$state_host")" = "$state_host" ] || fail 'invalid recovery email host'
+            ;;
+        *) fail 'unknown recovery state version' ;;
+    esac
     extra_record_data=''
     if IFS= read -r extra_record_data <&8 || [ -n "$extra_record_data" ]; then fail 'extra data in recovery record'; fi
     exec 8<&-
-    [ "$state_version" = 1 ] || fail 'unknown recovery state version'
     validate_group "$state_group"
     root_digest=$(printf '%s\n' "$state_root" | sha256sum)
     [ "${state_path##*/}" = "${root_digest%% *}-$state_group" ] || fail 'recovery state identity mismatch'
     case "$state_root" in /*) ;; *) fail 'invalid recovery configuration root' ;; esac
     check_secure_path "$state_root/groups/$state_group/config.env"
     [ "$(file_digest "$state_root/groups/$state_group/config.env")" = "$state_config_hash" ] || fail 'configuration changed while recovery was pending'
+    if [ "$state_version" = 2 ]; then
+        email_to=$state_email
+        email_host=$state_host
+        email_group=$state_group
+        email_state=$state_path
+    fi
     check_hook_script "$state_post"
     [ "$(file_digest "$state_post")" = "$state_post_hash" ] || fail 'POST script changed while recovery was pending'
 }
@@ -350,6 +504,15 @@ run_stage() {
     return "$stage_status"
 }
 
+run_notified_restic() {
+    email_issue=restic-failed
+    stage_traps
+    restic_status=0
+    run_stage restic "$@" || restic_status=$?
+    [ "$interrupted" -eq 0 ] || email_issue=interrupted
+    exit "$restic_status"
+}
+
 call_hook() {
     hook_phase=$1
     hook_mode=$2
@@ -363,12 +526,14 @@ call_hook() {
 }
 
 remove_pending_state() {
-    rm -- "$state_path/record" && rmdir -- "$state_path" && sync -f "$PENDING_DIR"
+    rm -f -- "$state_path/notified" && rm -- "$state_path/record" && rmdir -- "$state_path" && sync -f "$PENDING_DIR"
 }
 
 recover_state() (
+    prepare_email recovery
+    email_issue=recovery-failed
     recovery_status=0
-    trap 'recovery_status=$?; if [ "$recovery_status" -ne 0 ]; then log "CRITICAL: pending cleanup could not be completed: $state_path" >&2; fi' EXIT
+    trap 'recovery_status=$?; if [ "$recovery_status" -ne 0 ]; then log "CRITICAL: pending cleanup could not be completed: $state_path" >&2; fi; notify_result "$recovery_status"' EXIT
     read_pending_state
     stage_traps
     call_hook post recovery unknown "$state_post" || fail 'POST recovery failed; state preserved'
@@ -381,7 +546,12 @@ recover_selected_group() {
     check_secure_path "$PENDING_DIR"
     state_context "$1"
     [ -e "$state_path" ] || [ -L "$state_path" ] || return 0
-    recover_state
+    selected_recovery_status=0
+    recover_state || selected_recovery_status=$?
+    # recover_state owns this alert, even if submission failed or no recipient
+    # could be validated. Do not retry it in the enclosing backup EXIT trap.
+    if [ "$selected_recovery_status" -ne 0 ]; then email_to=''; fi
+    return "$selected_recovery_status"
 }
 
 finish_hook_backup() {
@@ -391,6 +561,7 @@ finish_hook_backup() {
     if [ "$interrupted" -ne 0 ]; then
         original_status=$interrupted
         backup_result=interrupted
+        email_issue=interrupted
         log "backup interrupted with exit code $original_status" >&2
     fi
     # Recovery validates the original configuration and exact POST bytes even
@@ -405,7 +576,13 @@ finish_hook_backup() {
     else
         log "CRITICAL: POST cleanup failed; pending state preserved (original exit code $original_status)" >&2
         [ "$original_status" -ne 0 ] || original_status=1
+        case "$email_issue" in
+            pre-failed) email_issue=pre-post-failed ;;
+            restic-failed) email_issue=restic-post-failed ;;
+            *) email_issue=post-failed ;;
+        esac
     fi
+    notify_result "$original_status"
     exit "$original_status"
 }
 
@@ -419,14 +596,21 @@ run_hook_backup() {
         pre_status=0
         call_hook pre normal not-run "$PW_BACKUP_PRE_HOOK" || pre_status=$?
         if [ "$pre_status" -ne 0 ]; then
+            email_issue=pre-failed
             log "PRE failed with exit code $pre_status; Restic was not started" >&2
             exit "$pre_status"
         fi
     fi
     backup_result=failed
+    email_issue=restic-failed
     restic_status=0
     run_stage restic "$@" || restic_status=$?
-    if [ "$restic_status" -eq 0 ]; then backup_result=success; else log "Restic failed with exit code $restic_status" >&2; fi
+    if [ "$restic_status" -eq 0 ]; then
+        backup_result=success
+        email_issue=operation-failed
+    else
+        log "Restic failed with exit code $restic_status" >&2
+    fi
     exit "$restic_status"
 }
 
@@ -479,6 +663,7 @@ run_maintenance() {
     else
         log 'applying Restic maintenance policy'
     fi
+    if [ -n "$email_to" ]; then run_notified_restic "$@"; fi
     exec restic "$@"
 }
 
@@ -506,6 +691,7 @@ check_legacy_group_safety() {
 run_all_maintenance() {
     groups=$(configured_groups)
     if [ -z "$groups" ]; then
+        prepare_email maintenance
         load_config
         run_maintenance "$1"
         return
@@ -517,6 +703,7 @@ run_all_maintenance() {
 '
     for scope in '' $groups; do
         prune_repository=$(
+            prepare_email maintenance
             load_config "$scope"
             if [ -n "$scope" ]; then
                 check_backup_config
@@ -544,6 +731,7 @@ $prune_repository
     # loaded legacy/group configuration. The parent keeps the one lock held.
     for scope in '' $groups; do
         (
+            prepare_email maintenance
             load_config "$scope"
             if is_true "$PW_BACKUP_RETENTION_ENABLED"; then
                 [ -n "$scope" ] || check_legacy_group_safety
@@ -557,10 +745,12 @@ $prune_repository
     # Reclaim shared repository data only after all forget policies succeed.
     for scope in '' $groups; do
         (
+            prepare_email prune
             load_config "$scope"
             if is_true "$PW_BACKUP_RETENTION_ENABLED" && is_true "$PW_BACKUP_PRUNE"; then
                 if is_true "$1"; then set -- prune --dry-run; else set -- prune; fi
                 log "pruning repository for ${scope:-legacy}"
+                if [ -n "$email_to" ]; then run_notified_restic "$@"; fi
                 exec restic "$@"
             fi
         )
@@ -579,7 +769,7 @@ case "$command" in
             validate_group "$2"
             selected_group=$2
         fi
-        if [ "$command" = run ]; then acquire_lock; fi
+        if [ "$command" = run ]; then prepare_email backup; acquire_lock; fi
         load_config "$selected_group"
         if [ "$command" = run ]; then
             run_backup
@@ -596,6 +786,7 @@ case "$command" in
             *) fail 'usage: pw-backup maintenance [--dry-run]' ;;
         esac
         [ "$#" -eq 0 ] || fail 'usage: pw-backup maintenance [--dry-run]'
+        prepare_email maintenance
         acquire_lock
         run_all_maintenance "$dry_run"
         ;;
@@ -623,6 +814,7 @@ case "$command" in
             validate_group "$2"
             selected_group=$2
         fi
+        prepare_email recovery
         run_recover "$selected_group"
         ;;
     --version|-V|version) printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;
