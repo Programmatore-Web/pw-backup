@@ -1,0 +1,16 @@
+[Unit]
+Description=PW Backup pending group cleanup
+Documentation=https://github.com/Programmatore-Web/pw-backup
+Wants=network-online.target
+After=local-fs.target network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pw-backup recover
+User=root
+Group=root
+UMask=0077
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

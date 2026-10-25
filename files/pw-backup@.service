@@ -2,11 +2,12 @@
 Description=PW Backup Restic backup for group %i
 Documentation=https://github.com/Programmatore-Web/pw-backup
 Wants=network-online.target
-After=network-online.target
+After=network-online.target pw-backup-recover.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/pw-backup run --group %i
+ExecStopPost=/usr/local/sbin/pw-backup recover --group %i
 User=root
 Group=root
 UMask=0077
@@ -14,3 +15,4 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 TimeoutStartSec=infinity
+TimeoutStopSec=660

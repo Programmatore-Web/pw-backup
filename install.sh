@@ -37,6 +37,7 @@ for required_file in \
     "$SCRIPT_DIR/files/pw-backup-maintenance.timer" \
     "$SCRIPT_DIR/files/pw-backup@.service" \
     "$SCRIPT_DIR/files/pw-backup@.timer" \
+    "$SCRIPT_DIR/files/pw-backup-recover.service" \
     "$SCRIPT_DIR/examples/config.env" \
     "$SCRIPT_DIR/examples/paths" \
     "$SCRIPT_DIR/examples/excludes"
@@ -58,6 +59,7 @@ install -D -m 0644 "$SCRIPT_DIR/files/pw-backup-maintenance.service" "$MAINTENAN
 install -D -m 0644 "$SCRIPT_DIR/files/pw-backup-maintenance.timer" "$MAINTENANCE_TIMER_PATH"
 install -D -m 0644 "$SCRIPT_DIR/files/pw-backup@.service" /etc/systemd/system/pw-backup@.service
 install -D -m 0644 "$SCRIPT_DIR/files/pw-backup@.timer" /etc/systemd/system/pw-backup@.timer
+install -D -m 0644 "$SCRIPT_DIR/files/pw-backup-recover.service" /etc/systemd/system/pw-backup-recover.service
 install -d -m 0700 "$CONFIG_DIR" "$CONFIG_DIR/groups" "$CACHE_DIR"
 install -d -m 0755 "$STATE_DIR"
 

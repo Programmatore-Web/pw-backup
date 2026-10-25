@@ -6,6 +6,7 @@ PROGRAM_VERSION='0.2.0'
 DEFAULT_CONFIG_DIR='/etc/pw-backup'
 CONFIG_ROOT=${PW_BACKUP_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}
 LOCK_DIR='/run/pw-backup'
+PENDING_DIR='/var/lib/pw-backup/pending'
 
 log() { printf '%s: %s\n' "$PROGRAM_NAME" "$*"; }
 fail() { printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
@@ -17,6 +18,7 @@ Usage:
   pw-backup maintenance [--dry-run]
   pw-backup check-config [--group <name>]
   pw-backup restic [--group <name>] <arguments...>
+  pw-backup recover [--group <name>]
   pw-backup --version
   pw-backup --help
 
@@ -25,6 +27,7 @@ Commands:
   maintenance  Apply legacy and group retention and optional prune.
   check-config Validate backup and maintenance configuration.
   restic       Run Restic with the configured repository environment.
+  recover      Complete pending group cleanup without starting backups.
 HELP
 }
 
@@ -82,7 +85,8 @@ load_config() {
             PW_BACKUP_TAG PW_BACKUP_HOST PW_BACKUP_SKIP_IF_UNCHANGED \
             PW_BACKUP_RETENTION_ENABLED PW_BACKUP_KEEP_LAST PW_BACKUP_KEEP_HOURLY \
             PW_BACKUP_KEEP_DAILY PW_BACKUP_KEEP_WEEKLY PW_BACKUP_KEEP_MONTHLY \
-            PW_BACKUP_KEEP_YEARLY PW_BACKUP_PRUNE
+            PW_BACKUP_KEEP_YEARLY PW_BACKUP_PRUNE \
+            PW_BACKUP_PRE_HOOK PW_BACKUP_POST_HOOK
     else
         CONFIG_DIR=$CONFIG_ROOT
         CONFIG_FILE=${PW_BACKUP_CONFIG_FILE:-$CONFIG_DIR/config.env}
@@ -107,6 +111,8 @@ load_config() {
             *) fail "PW_BACKUP_HOST must be explicit and non-empty for group $GROUP_NAME" ;;
         esac
         : "${RESTIC_CACHE_DIR:=/var/cache/pw-backup/groups/$GROUP_NAME}"
+        : "${PW_BACKUP_PRE_HOOK:=}"
+        : "${PW_BACKUP_POST_HOOK:=}"
     fi
     : "${RESTIC_PASSWORD_FILE:=$CONFIG_DIR/repository-password}"
     : "${RESTIC_CACHE_DIR:=/var/cache/pw-backup/restic}"
@@ -158,6 +164,7 @@ check_backup_config() {
         fail "excludes file is not readable: $EXCLUDES_FILE"
     fi
     is_true "$PW_BACKUP_SKIP_IF_UNCHANGED" >/dev/null || true
+    if [ -n "$GROUP_NAME" ]; then check_hook_config; fi
     if [ -z "$GROUP_NAME" ]; then
         # Restic accepts comma-separated tags; reserve every group-tag token.
         case ",$PW_BACKUP_TAG" in
@@ -171,6 +178,7 @@ check_backup_config() {
 
 run_backup() {
     check_backup_config
+    if [ -n "$GROUP_NAME" ]; then recover_selected_group "$GROUP_NAME"; fi
     set -- backup --files-from "$PATHS_FILE"
     [ ! -r "$EXCLUDES_FILE" ] || set -- "$@" --exclude-file "$EXCLUDES_FILE"
     [ -z "$PW_BACKUP_TAG" ] || set -- "$@" --tag "$PW_BACKUP_TAG"
@@ -178,7 +186,260 @@ run_backup() {
     [ -z "$GROUP_NAME" ] || set -- "$@" --group-by host,paths,tags
     if is_true "$PW_BACKUP_SKIP_IF_UNCHANGED"; then set -- "$@" --skip-if-unchanged; fi
     log 'starting Restic backup'
+    if [ -n "$GROUP_NAME" ] && [ -n "$PW_BACKUP_PRE_HOOK$PW_BACKUP_POST_HOOK" ]; then
+        run_hook_backup "$@"
+    fi
     exec restic "$@"
+}
+
+# A sticky root-owned directory (for example /tmp) protects root-owned children
+# against replacement too. Every component, not just the final file, is checked.
+check_secure_path() {
+    secure_path=$1
+    case "$secure_path" in
+        /*) ;;
+        *) fail "path must be absolute: $secure_path" ;;
+    esac
+    case "$secure_path" in
+        *'
+'*|*"$(printf '\r')"*|*//*|*/./*|*/../*|*/.|*/..) fail 'unsafe path syntax' ;;
+    esac
+    [ -f "$secure_path" ] || [ -d "$secure_path" ] || fail "not a regular file or directory: $secure_path"
+    while :; do
+        [ ! -L "$secure_path" ] || fail "symlinks are not allowed: $secure_path"
+        [ "$(stat -c '%u' "$secure_path")" = 0 ] || fail "path must be owned by root: $secure_path"
+        if [ -n "$(find "$secure_path" -maxdepth 0 -perm /022 -print)" ]; then
+            if [ ! -d "$secure_path" ] || [ -z "$(find "$secure_path" -maxdepth 0 -perm -1000 -print)" ]; then
+                fail "path is writable by group or others: $secure_path"
+            fi
+        fi
+        [ "$secure_path" != / ] || break
+        secure_path=${secure_path%/*}
+        [ -n "$secure_path" ] || secure_path=/
+    done
+}
+
+check_hook_script() {
+    check_secure_path "$1"
+    [ -f "$1" ] || fail "hook must be a regular file: $1"
+    [ -x "$1" ] || fail "hook must be executable: $1"
+}
+
+check_hook_config() {
+    [ -z "$PW_BACKUP_PRE_HOOK" ] || [ -n "$PW_BACKUP_POST_HOOK" ] || fail 'PRE requires an idempotent POST hook'
+    [ -z "$PW_BACKUP_PRE_HOOK" ] || check_hook_script "$PW_BACKUP_PRE_HOOK"
+    [ -z "$PW_BACKUP_POST_HOOK" ] || check_hook_script "$PW_BACKUP_POST_HOOK"
+    if [ -n "$PW_BACKUP_PRE_HOOK$PW_BACKUP_POST_HOOK" ]; then
+        hook_root=$(CDPATH='' cd -- "$CONFIG_ROOT" && pwd -P)
+        check_secure_path "$hook_root/groups/$GROUP_NAME/config.env"
+    fi
+}
+
+file_digest() {
+    digest=$(sha256sum < "$1") || return 1
+    printf '%s' "${digest%% *}"
+}
+
+state_context() {
+    state_root=$(CDPATH='' cd -- "$CONFIG_ROOT" && pwd -P) || fail 'cannot resolve configuration root for recovery'
+    case "$state_root" in *'
+'*) fail 'configuration root must be a single line' ;; esac
+    root_digest=$(printf '%s\n' "$state_root" | sha256sum)
+    state_key="${root_digest%% *}-$1"
+    state_path="$PENDING_DIR/$state_key"
+}
+
+create_pending_state() {
+    state_context "$GROUP_NAME"
+    for state_dir in /var/lib/pw-backup "$PENDING_DIR"; do
+        [ ! -L "$state_dir" ] || fail 'recovery directory must not be a symlink'
+        (umask 077; mkdir -p "$state_dir")
+        check_secure_path "$state_dir"
+    done
+    chmod 0700 "$PENDING_DIR"
+    # mkdir reserves the obligation atomically; even a partially written state
+    # must block this group rather than be overwritten after a crash.
+    (umask 077; mkdir "$state_path") || fail 'pending recovery already exists'
+    state_post_hash=$(file_digest "$PW_BACKUP_POST_HOOK")
+    state_config_hash=$(file_digest "$state_root/groups/$GROUP_NAME/config.env")
+    (umask 077; printf '%s\n' 1 "$state_root" "$GROUP_NAME" "$PW_BACKUP_POST_HOOK" \
+        "$state_post_hash" "$state_config_hash" > "$state_path/record.tmp") || fail 'cannot write recovery state'
+    sync -f "$state_path/record.tmp" || fail 'cannot persist recovery state'
+    mv -T -- "$state_path/record.tmp" "$state_path/record" || fail 'cannot publish recovery state'
+    sync -f "$PENDING_DIR" || fail 'cannot persist published recovery state'
+}
+
+read_pending_state() {
+    check_secure_path "$PENDING_DIR"
+    check_secure_path "$state_path"
+    [ -d "$state_path" ] || fail 'pending recovery is not a directory'
+    [ "$(stat -c '%a' "$PENDING_DIR")" = 700 ] || fail 'recovery directory must have mode 0700'
+    [ "$(stat -c '%a' "$state_path")" = 700 ] || fail 'pending directory must have mode 0700'
+    [ -z "$(find "$state_path" -mindepth 1 -maxdepth 1 ! -name record -print)" ] || fail 'incomplete or ambiguous recovery state'
+    check_secure_path "$state_path/record"
+    [ -f "$state_path/record" ] || fail 'missing recovery record'
+    [ "$(stat -c '%a' "$state_path/record")" = 600 ] || fail 'recovery record must have mode 0600'
+    exec 8<"$state_path/record"
+    {
+        IFS= read -r state_version && IFS= read -r state_root &&
+        IFS= read -r state_group && IFS= read -r state_post &&
+        IFS= read -r state_post_hash && IFS= read -r state_config_hash
+    } <&8 || fail 'incomplete recovery record'
+    extra_record_data=''
+    if IFS= read -r extra_record_data <&8 || [ -n "$extra_record_data" ]; then fail 'extra data in recovery record'; fi
+    exec 8<&-
+    [ "$state_version" = 1 ] || fail 'unknown recovery state version'
+    validate_group "$state_group"
+    root_digest=$(printf '%s\n' "$state_root" | sha256sum)
+    [ "${state_path##*/}" = "${root_digest%% *}-$state_group" ] || fail 'recovery state identity mismatch'
+    case "$state_root" in /*) ;; *) fail 'invalid recovery configuration root' ;; esac
+    check_secure_path "$state_root/groups/$state_group/config.env"
+    [ "$(file_digest "$state_root/groups/$state_group/config.env")" = "$state_config_hash" ] || fail 'configuration changed while recovery was pending'
+    check_hook_script "$state_post"
+    [ "$(file_digest "$state_post")" = "$state_post_hash" ] || fail 'POST script changed while recovery was pending'
+}
+
+# Only hook-enabled backups need a waiting shell. Stages have their own process
+# group, so cleanup never races a still-writing Restic child after a signal.
+interrupt_stage() {
+    interrupted=$1
+    trap '' HUP INT TERM
+    if [ -n "$active_pid" ]; then
+        kill -TERM "-$active_pid" 2>/dev/null || kill -TERM "$active_pid" 2>/dev/null || true
+        (
+            exec 9>&-
+            sleep 10
+            kill -KILL "-$active_pid" 2>/dev/null || true
+        ) &
+        killer_pid=$!
+        wait "$active_pid" 2>/dev/null || true
+        kill -KILL "-$active_pid" 2>/dev/null || true
+        kill "$killer_pid" 2>/dev/null || true
+        wait "$killer_pid" 2>/dev/null || true
+        active_pid=''
+    fi
+}
+
+stage_traps() {
+    active_pid=''
+    interrupted=0
+    trap 'interrupt_stage 129' HUP
+    trap 'interrupt_stage 130' INT
+    trap 'interrupt_stage 143' TERM
+}
+
+run_stage() {
+    [ "$interrupted" -eq 0 ] || return "$interrupted"
+    setsid env --default-signal=HUP,INT,TERM "$@" &
+    active_pid=$!
+    if [ "$interrupted" -ne 0 ]; then interrupt_stage "$interrupted"; return "$interrupted"; fi
+    stage_status=0
+    wait "$active_pid" || stage_status=$?
+    active_pid=''
+    [ "$interrupted" -eq 0 ] || return "$interrupted"
+    return "$stage_status"
+}
+
+call_hook() {
+    hook_phase=$1
+    hook_mode=$2
+    hook_result=$3
+    hook_script=$4
+    log "running $hook_phase hook for $state_group ($hook_mode, backup=$hook_result)" >&2
+    run_stage timeout --kill-after=10s 300s env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        PW_BACKUP_CONFIG_DIR="$state_root" PW_BACKUP_GROUP="$state_group" \
+        PW_BACKUP_HOOK_PHASE="$hook_phase" PW_BACKUP_HOOK_MODE="$hook_mode" \
+        PW_BACKUP_BACKUP_STATUS="$hook_result" "$hook_script"
+}
+
+remove_pending_state() {
+    rm -- "$state_path/record" && rmdir -- "$state_path" && sync -f "$PENDING_DIR"
+}
+
+recover_state() (
+    recovery_status=0
+    trap 'recovery_status=$?; if [ "$recovery_status" -ne 0 ]; then log "CRITICAL: pending cleanup could not be completed: $state_path" >&2; fi' EXIT
+    read_pending_state
+    stage_traps
+    call_hook post recovery unknown "$state_post" || fail 'POST recovery failed; state preserved'
+    remove_pending_state || fail 'cannot remove completed recovery state'
+    log "recovery completed for $state_group" >&2
+)
+
+recover_selected_group() {
+    [ -e "$PENDING_DIR" ] || [ -L "$PENDING_DIR" ] || return 0
+    check_secure_path "$PENDING_DIR"
+    state_context "$1"
+    [ -e "$state_path" ] || [ -L "$state_path" ] || return 0
+    recover_state
+}
+
+finish_hook_backup() {
+    original_status=$1
+    trap - EXIT
+    trap '' HUP INT TERM
+    if [ "$interrupted" -ne 0 ]; then
+        original_status=$interrupted
+        backup_result=interrupted
+        log "backup interrupted with exit code $original_status" >&2
+    fi
+    # Recovery validates the original configuration and exact POST bytes even
+    # on the normal path, but retains the known backup result for the hook.
+    if (
+        read_pending_state
+        interrupted=0
+        call_hook post normal "$backup_result" "$state_post" || exit 1
+        remove_pending_state
+    ); then
+        :
+    else
+        log "CRITICAL: POST cleanup failed; pending state preserved (original exit code $original_status)" >&2
+        [ "$original_status" -ne 0 ] || original_status=1
+    fi
+    exit "$original_status"
+}
+
+run_hook_backup() {
+    create_pending_state
+    state_group=$GROUP_NAME
+    backup_result=not-run
+    stage_traps
+    trap 'finish_hook_backup "$?"' EXIT
+    if [ -n "$PW_BACKUP_PRE_HOOK" ]; then
+        pre_status=0
+        call_hook pre normal not-run "$PW_BACKUP_PRE_HOOK" || pre_status=$?
+        if [ "$pre_status" -ne 0 ]; then
+            log "PRE failed with exit code $pre_status; Restic was not started" >&2
+            exit "$pre_status"
+        fi
+    fi
+    backup_result=failed
+    restic_status=0
+    run_stage restic "$@" || restic_status=$?
+    if [ "$restic_status" -eq 0 ]; then backup_result=success; else log "Restic failed with exit code $restic_status" >&2; fi
+    exit "$restic_status"
+}
+
+run_recover() {
+    # ExecStopPost must be a no-op without state, including during uninstall
+    # while its caller already holds the machine-wide lock.
+    [ -e "$PENDING_DIR" ] || [ -L "$PENDING_DIR" ] || return 0
+    check_secure_path "$PENDING_DIR"
+    [ -d "$PENDING_DIR" ] || fail 'recovery state directory is invalid'
+    if [ -n "$1" ]; then
+        state_context "$1"
+        [ -e "$state_path" ] || [ -L "$state_path" ] || return 0
+    elif [ -z "$(find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        return 0
+    fi
+    acquire_lock
+    if [ -n "$1" ]; then recover_selected_group "$1"; return; fi
+    recovery_failed=0
+    for state_path in "$PENDING_DIR"/* "$PENDING_DIR"/.[!.]* "$PENDING_DIR"/..?*; do
+        [ -e "$state_path" ] || [ -L "$state_path" ] || continue
+        recover_state || recovery_failed=1
+    done
+    return "$recovery_failed"
 }
 
 run_maintenance() {
@@ -341,6 +602,17 @@ case "$command" in
         load_config "$selected_group"
         check_common_config
         exec restic "$@"
+        ;;
+    recover)
+        shift
+        selected_group=''
+        if [ "$#" -ne 0 ]; then
+            [ "$#" -eq 2 ] || fail 'usage: pw-backup recover [--group <name>]'
+            [ "$1" = --group ] || fail 'usage: pw-backup recover [--group <name>]'
+            validate_group "$2"
+            selected_group=$2
+        fi
+        run_recover "$selected_group"
         ;;
     --version|-V|version) printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;
     --help|-h|help) show_help ;;

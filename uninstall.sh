@@ -38,6 +38,23 @@ esac
 [ "$(id -u)" -eq 0 ] || fail 'run this uninstaller as root'
 command -v systemctl >/dev/null 2>&1 || fail 'systemctl is not available'
 
+# Serialize the pending-state check and removal with every backup/recovery.
+# ExecStopPost exits before acquiring the lock when its group has no state.
+[ ! -L /run/pw-backup ] || fail 'unsafe lock directory'
+(umask 077; mkdir -p /run/pw-backup)
+[ "$(stat -c '%u' /run/pw-backup)" = 0 ] || fail 'lock directory must be owned by root'
+chmod 0700 /run/pw-backup
+[ ! -L /run/pw-backup/operation.lock ] || fail 'unsafe lock file'
+umask 077
+exec 9>/run/pw-backup/operation.lock
+flock -w 300 9 || fail 'could not acquire the shared local lock within 300s'
+if [ -L "$STATE_DIR/pending" ]; then fail 'CRITICAL: unsafe recovery state; uninstall refused'; fi
+if [ -e "$STATE_DIR/pending" ]; then
+    [ -d "$STATE_DIR/pending" ] || fail 'CRITICAL: invalid recovery state; uninstall refused'
+    [ -z "$(find "$STATE_DIR/pending" -mindepth 1 -maxdepth 1 -print -quit)" ] || \
+        fail 'CRITICAL: pending recovery must be completed before uninstall, including --purge'
+fi
+
 # Include running, disabled, and enabled-on-disk instances. Do not pass wildcards
 # to systemctl disable: they are not expanded there like list-units patterns.
 group_units=$(
@@ -66,7 +83,7 @@ for unit in $group_units; do
             ;;
     esac
 done
-for unit in pw-backup.service pw-backup-maintenance.service; do
+for unit in pw-backup.service pw-backup-maintenance.service pw-backup-recover.service; do
     systemctl stop "$unit" >/dev/null 2>&1 || true
     systemctl disable "$unit" >/dev/null 2>&1 || true
 done
@@ -74,7 +91,7 @@ done
 rm -f "$BIN_PATH"
 for unit in \
     pw-backup.service pw-backup.timer \
-    pw-backup-maintenance.service pw-backup-maintenance.timer
+    pw-backup-maintenance.service pw-backup-maintenance.timer pw-backup-recover.service
 do
     rm -f "/etc/systemd/system/$unit"
     rm -rf "/etc/systemd/system/$unit.d"
@@ -103,6 +120,7 @@ systemctl daemon-reload
 systemctl reset-failed \
     pw-backup.service pw-backup.timer \
     pw-backup-maintenance.service pw-backup-maintenance.timer \
+    pw-backup-recover.service \
     >/dev/null 2>&1 || true
 for unit in $group_units; do
     systemctl reset-failed "$unit" >/dev/null 2>&1 || true
