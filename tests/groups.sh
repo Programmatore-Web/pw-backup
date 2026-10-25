@@ -43,7 +43,9 @@ chmod 0755 "$TEST_ROOT/bin/restic"
 PATH="$TEST_ROOT/bin:$PATH"
 export PATH
 printf '%s\n' 'fictitious-test-password' > "$RESTIC_PASSWORD_FILE"
-printf '%s\n' "$SOURCE_DIR" > "$CONFIG_ROOT/paths"
+# Relative sources omit /tmp ancestor metadata, which Restic itself changes
+# while creating temporary packs. Both groups still have identical .paths.
+printf '%s\n' source > "$CONFIG_ROOT/paths"
 cat > "$CONFIG_ROOT/config.env" <<EOF_CONFIG
 RESTIC_REPOSITORY='$RESTIC_REPOSITORY'
 RESTIC_PASSWORD_FILE='$RESTIC_PASSWORD_FILE'
@@ -65,10 +67,11 @@ PW_BACKUP_RETENTION_ENABLED=true
 PW_BACKUP_KEEP_LAST=1
 PW_BACKUP_PRUNE=false
 EOF_CONFIG
-    printf '%s\n' "$SOURCE_DIR" > "$CONFIG_ROOT/groups/$group/paths"
+    printf '%s\n' source > "$CONFIG_ROOT/groups/$group/paths"
 done
 sed -i 's/PW_BACKUP_KEEP_LAST=1/PW_BACKUP_KEEP_LAST=2/; s/PW_BACKUP_PRUNE=false/PW_BACKUP_PRUNE=true/' "$CONFIG_ROOT/groups/documents/config.env"
 chmod 0600 "$CONFIG_ROOT/config.env" "$CONFIG_ROOT/groups/"*/config.env "$RESTIC_PASSWORD_FILE"
+cd "$TEST_ROOT"
 
 pw check-config
 pw check-config --group documents
@@ -204,7 +207,7 @@ assert_eq 1 "$(count_scope machine-a pw-backup-group-media)" 'media retention in
 assert_eq "$foreign_ids" "$(snapshots | jq -c '[.[] | select(.hostname == "machine-b" or (.tags | index("unrelated")) or (.tags | index("pw-backup-group-unconfigured")))] | map(.id) | sort')" 'foreign snapshot IDs survived retention and prune'
 pw restic --group documents check
 pw restic --group documents restore "$documents_latest" --target "$TEST_ROOT/restore"
-cmp "$TEST_ROOT/expected-document" "$TEST_ROOT/restore$SOURCE_DIR/document.txt" || fail 'restore after retention and prune differs'
+cmp "$TEST_ROOT/expected-document" "$TEST_ROOT/restore/source/document.txt" || fail 'restore after retention and prune differs'
 
 # Explicitly filtered legacy retention can coexist with group policies.
 sed -i "s|RESTIC_REPOSITORY=.*|RESTIC_REPOSITORY='$RESTIC_REPOSITORY'|; s/PW_BACKUP_RETENTION_ENABLED=false/PW_BACKUP_RETENTION_ENABLED=true/" "$CONFIG_ROOT/config.env"
