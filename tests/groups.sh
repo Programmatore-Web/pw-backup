@@ -75,6 +75,36 @@ cd "$TEST_ROOT"
 
 pw check-config
 pw check-config --group documents
+
+# Validate the entire configuration path before sourcing, even without hooks.
+# The custom root is inside a protected temporary directory below sticky /tmp.
+cp "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/group-config.original"
+cat >> "$CONFIG_ROOT/groups/documents/config.env" <<EOF_CONFIG
+printf '%s\n' loaded > '$TEST_ROOT/config-sourced'
+EOF_CONFIG
+pw check-config --group documents
+assert_eq loaded "$(cat "$TEST_ROOT/config-sourced")" 'safe group configuration was sourced'
+PW_BACKUP_CONFIG_DIR=config "$RUNNER" check-config --group documents
+rm "$TEST_ROOT/config-sourced"
+
+chmod 0777 "$CONFIG_ROOT/groups"
+expect_failure 'path is writable by group or others' check-config --group documents
+[ ! -e "$TEST_ROOT/config-sourced" ] || fail 'configuration in an unsafe directory was sourced'
+chmod 0755 "$CONFIG_ROOT/groups"
+
+mv "$CONFIG_ROOT/groups/documents/config.env" "$TEST_ROOT/group-config.link-target"
+ln -s "$TEST_ROOT/group-config.link-target" "$CONFIG_ROOT/groups/documents/config.env"
+expect_failure 'configuration file must not be writable by group or others' check-config --group documents
+[ ! -e "$TEST_ROOT/config-sourced" ] || fail 'symlinked configuration was sourced'
+rm "$CONFIG_ROOT/groups/documents/config.env"
+mv "$TEST_ROOT/group-config.link-target" "$CONFIG_ROOT/groups/documents/config.env"
+
+ln -s "$CONFIG_ROOT" "$TEST_ROOT/config-link"
+CONFIG_ROOT="$TEST_ROOT/config-link" expect_failure 'symlinks are not allowed' check-config --group documents
+[ ! -e "$TEST_ROOT/config-sourced" ] || fail 'configuration below a symlinked root was sourced'
+rm "$TEST_ROOT/config-link"
+mv "$TEST_ROOT/group-config.original" "$CONFIG_ROOT/groups/documents/config.env"
+
 pw restic --group documents init
 assert_eq '[]' "$(pw restic snapshots --json | jq -c 'map(.id)')" 'passthrough JSON output'
 assert_eq 'pw-backup 0.2.0' "$(pw --version)" 'runner version unchanged'

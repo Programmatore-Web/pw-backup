@@ -99,6 +99,17 @@ load_config() {
     if find "$CONFIG_FILE" -perm /022 -print -quit | grep -q .; then
         fail "configuration file must not be writable by group or others: $CONFIG_FILE"
     fi
+    if [ -n "$GROUP_NAME" ]; then
+        group_config_path=$CONFIG_FILE
+        case "$group_config_path" in
+            /*) ;;
+            *)
+                config_working_dir=$(pwd -P)
+                group_config_path="${config_working_dir%/}/$group_config_path"
+                ;;
+        esac
+        check_secure_path "$group_config_path"
+    fi
 
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
@@ -231,10 +242,6 @@ check_hook_config() {
     [ -z "$PW_BACKUP_PRE_HOOK" ] || [ -n "$PW_BACKUP_POST_HOOK" ] || fail 'PRE requires an idempotent POST hook'
     [ -z "$PW_BACKUP_PRE_HOOK" ] || check_hook_script "$PW_BACKUP_PRE_HOOK"
     [ -z "$PW_BACKUP_POST_HOOK" ] || check_hook_script "$PW_BACKUP_POST_HOOK"
-    if [ -n "$PW_BACKUP_PRE_HOOK$PW_BACKUP_POST_HOOK" ]; then
-        hook_root=$(CDPATH='' cd -- "$CONFIG_ROOT" && pwd -P)
-        check_secure_path "$hook_root/groups/$GROUP_NAME/config.env"
-    fi
 }
 
 file_digest() {
