@@ -3,8 +3,6 @@ Description=PW Backup Restic backup for group %i
 Documentation=https://github.com/Programmatore-Web/pw-backup
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/etc/pw-backup/groups/%i/config.env
-ConditionPathExists=/etc/pw-backup/groups/%i/paths
 
 [Service]
 Type=oneshot

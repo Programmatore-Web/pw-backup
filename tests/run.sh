@@ -63,6 +63,11 @@ systemd-analyze verify --instance=documents \
     /etc/systemd/system/pw-backup-maintenance.timer \
     /etc/systemd/system/pw-backup@.service \
     /etc/systemd/system/pw-backup@.timer
+if grep -Eq '^[[:space:]]*ConditionPathExists=' /etc/systemd/system/pw-backup@.service; then
+    fail 'group service must let the runner validate the selected configuration root'
+fi
+assert_eq '/usr/local/sbin/pw-backup run --group %i' \
+    "$(sed -n 's/^ExecStart=//p' /etc/systemd/system/pw-backup@.service)" 'group service runner command'
 if grep -Eq '(^| )(enable|start|restart)( |$)' "$SYSTEMCTL_LOG"; then
     fail 'installer enabled or started a unit without explicit administrator action'
 fi
@@ -122,6 +127,16 @@ if PW_BACKUP_CONFIG_DIR="$CONFIG_DIR" pw-backup check-config >"$TEST_ROOT/invali
     fail 'enabled retention without policy unexpectedly validated'
 fi
 grep -Fq 'no keep policy is configured' "$TEST_ROOT/invalid.log" || fail 'missing retention validation message'
+
+# Without configured groups, even a group-style legacy tag remains valid.
+# Existing snapshot IDs must survive this ordinary 0.2.0-style backup.
+sed -i 's/PW_BACKUP_RETENTION_ENABLED=true/PW_BACKUP_RETENTION_ENABLED=false/; s/PW_BACKUP_TAG=integration-test/PW_BACKUP_TAG=pw-backup-group-documents/' "$CONFIG_DIR/config.env"
+before_ids=$(PW_BACKUP_CONFIG_DIR="$CONFIG_DIR" pw-backup restic snapshots --json | jq -c 'map(.id) | sort')
+PW_BACKUP_CONFIG_DIR="$CONFIG_DIR" pw-backup run
+after_snapshots=$(PW_BACKUP_CONFIG_DIR="$CONFIG_DIR" pw-backup restic snapshots --json)
+assert_eq 3 "$(printf '%s\n' "$after_snapshots" | jq length)" 'legacy reserved-style tag without groups'
+assert_eq 1 "$(printf '%s\n' "$after_snapshots" | jq '[.[] | select(.tags | index("pw-backup-group-documents"))] | length')" 'legacy tag preserved without groups'
+assert_eq 0 "$(printf '%s\n' "$after_snapshots" | jq --argjson before "$before_ids" 'map(.id) as $after | ($before - $after) | length')" 'existing legacy snapshots preserved'
 
 sh "$PROJECT_ROOT/tests/groups.sh"
 sh "$PROJECT_ROOT/tests/locking.sh"

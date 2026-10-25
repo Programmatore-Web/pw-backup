@@ -89,6 +89,9 @@ expect_failure 'usage:' run --group
 expect_failure 'usage:' check-config --group documents extra
 expect_failure 'missing Restic arguments' restic --group documents
 expect_failure 'configuration file is not readable' check-config --group missing
+: > "$TEST_COMMAND_LOG"
+RUNNER=/usr/local/sbin/pw-backup expect_failure 'configuration file is not readable' run --group missing
+[ ! -s "$TEST_COMMAND_LOG" ] || fail 'missing service group configuration reached Restic'
 
 # Ambient legacy values and file overrides must not alter group settings.
 PW_BACKUP_TAG=ambient-tag PW_BACKUP_HOST=ambient-host \
@@ -104,6 +107,9 @@ expect_failure 'paths file is not readable' check-config --group incomplete
 cp "$CONFIG_ROOT/groups/documents/paths" "$CONFIG_ROOT/groups/incomplete/paths"
 sed -i 's/PW_BACKUP_HOST=machine-a/PW_BACKUP_HOST=/' "$CONFIG_ROOT/groups/incomplete/config.env"
 PW_BACKUP_HOST=ambient-host expect_failure 'PW_BACKUP_HOST must be explicit' check-config --group incomplete
+: > "$TEST_COMMAND_LOG"
+RUNNER=/usr/local/sbin/pw-backup expect_failure 'PW_BACKUP_HOST must be explicit' run --group incomplete
+[ ! -s "$TEST_COMMAND_LOG" ] || fail 'invalid service group configuration reached Restic'
 sed -i "s/PW_BACKUP_HOST=/PW_BACKUP_HOST='   '/" "$CONFIG_ROOT/groups/incomplete/config.env"
 expect_failure 'PW_BACKUP_HOST must be explicit' check-config --group incomplete
 cp "$CONFIG_ROOT/groups/documents/config.env" "$CONFIG_ROOT/groups/incomplete/config.env"
@@ -120,7 +126,8 @@ rm -rf "$CONFIG_ROOT/groups/incomplete"
 # Identical host AND paths: the second group must create its own first snapshot
 # even though skip-if-unchanged is enabled and the source has not changed.
 printf '%s\n' 'version 1' > "$SOURCE_DIR/document.txt"
-pw run --group documents
+# Execute the installed template's asserted ExecStart with an alternate root.
+PW_BACKUP_CONFIG_DIR="$CONFIG_ROOT" /usr/local/sbin/pw-backup run --group documents
 documents_first=$(latest_id pw-backup-group-documents)
 pw run --group media
 media_first=$(latest_id pw-backup-group-media)
@@ -160,6 +167,17 @@ for version in 1 2; do
 done
 foreign_ids=$(snapshots | jq -c '[.[] | select(.hostname == "machine-b" or (.tags | index("unrelated")) or (.tags | index("pw-backup-group-unconfigured")))] | map(.id) | sort')
 before_ids=$(snapshot_ids)
+
+# Disabled legacy retention must not allow a backup to join a group's history.
+for tag in pw-backup-group-documents ordinary,pw-backup-group-documents pw-backup-group-documents,ordinary; do
+    sed -i "s/^PW_BACKUP_TAG=.*/PW_BACKUP_TAG=$tag/" "$CONFIG_ROOT/config.env"
+    : > "$TEST_COMMAND_LOG"
+    expect_failure 'legacy backups cannot use reserved group tags' run
+    [ ! -s "$TEST_COMMAND_LOG" ] || fail 'reserved legacy tag reached Restic'
+    assert_eq "$before_ids" "$(snapshot_ids)" 'rejected backup changed existing snapshots'
+done
+assert_eq "$before_ids" "$(pw restic snapshots --json | jq -c 'map(.id) | sort')" 'explicit Restic passthrough remains available'
+sed -i 's/^PW_BACKUP_TAG=.*/PW_BACKUP_TAG=legacy-test/' "$CONFIG_ROOT/config.env"
 
 # A later invalid group must stop maintenance BEFORE earlier valid policies.
 mkdir "$CONFIG_ROOT/groups/zz-invalid"

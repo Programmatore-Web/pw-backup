@@ -158,6 +158,15 @@ check_backup_config() {
         fail "excludes file is not readable: $EXCLUDES_FILE"
     fi
     is_true "$PW_BACKUP_SKIP_IF_UNCHANGED" >/dev/null || true
+    if [ -z "$GROUP_NAME" ]; then
+        # Restic accepts comma-separated tags; reserve every group-tag token.
+        case ",$PW_BACKUP_TAG" in
+            *,pw-backup-group-*)
+                legacy_groups=$(configured_groups)
+                [ -z "$legacy_groups" ] || fail 'legacy backups cannot use reserved group tags when groups exist'
+                ;;
+        esac
+    fi
 }
 
 run_backup() {
