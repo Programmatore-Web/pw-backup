@@ -37,7 +37,7 @@ prepare_email() {
     email_state=''
     email_issue=operation-failed
     operation_status=0
-    trap 'operation_status=$?; notify_result "$operation_status"' EXIT
+    trap 'operation_status=$?; notify_result "$operation_status" || :' EXIT
 }
 
 # Best effort, once per invocation. Never use command output or logs as mail text.
@@ -83,7 +83,10 @@ notify_result() (
     message_host=$(safe_email_host "$email_host")
     case "$email_code" in ''|*[!0-9]*) email_code=1 ;; esac
     [ "${#email_code}" -le 3 ] || email_code=1
-    email_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    email_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || {
+        log 'WARNING: could not prepare email timestamp; original result preserved' >&2
+        return 0
+    }
     email_status=0
     {
         printf 'To: %s\nSubject: [pw-backup] %s %s\n' "$email_to" "$email_level" "$message_operation"
@@ -126,7 +129,7 @@ notify_lock_failure() (
             load_config "$email_scope"
             if [ "$email_operation" = maintenance ] && ! is_true "$PW_BACKUP_RETENTION_ENABLED"; then exit 0; fi
             email_issue=lock-timeout
-            notify_result 1
+            notify_result 1 || :
         ) || log 'WARNING: lock notification recipient could not be read safely' >&2
     done
 )
@@ -533,7 +536,7 @@ recover_state() (
     prepare_email recovery
     email_issue=recovery-failed
     recovery_status=0
-    trap 'recovery_status=$?; if [ "$recovery_status" -ne 0 ]; then log "CRITICAL: pending cleanup could not be completed: $state_path" >&2; fi; notify_result "$recovery_status"' EXIT
+    trap 'recovery_status=$?; if [ "$recovery_status" -ne 0 ]; then log "CRITICAL: pending cleanup could not be completed: $state_path" >&2; fi; notify_result "$recovery_status" || :' EXIT
     read_pending_state
     stage_traps
     call_hook post recovery unknown "$state_post" || fail 'POST recovery failed; state preserved'
@@ -582,7 +585,7 @@ finish_hook_backup() {
             *) email_issue=post-failed ;;
         esac
     fi
-    notify_result "$original_status"
+    notify_result "$original_status" || :
     exit "$original_status"
 }
 

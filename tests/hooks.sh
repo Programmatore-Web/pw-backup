@@ -573,19 +573,26 @@ expect_status 0 recover
 assert_no_state
 
 write_config '' '' alerts@example.invalid
-for mail_failure in failed hold missing; do
+for mail_failure in failed hold missing prepare; do
     reset_mail
     printf '%s\n' failed > "$TEST_ROOT/restic-mode"
     printf '%s\n' "$mail_failure" > "$TEST_ROOT/mail-mode"
     if [ "$mail_failure" = missing ]; then
         mv "$TEST_ROOT/bin/sendmail" "$TEST_ROOT/sendmail.saved"
         if command -v sendmail >/dev/null 2>&1; then fail 'missing-MTA test refuses to use a real sendmail'; fi
+    elif [ "$mail_failure" = prepare ]; then
+        printf '#!/bin/sh\nexit 68\n' > "$TEST_ROOT/bin/date"
+        chmod 0755 "$TEST_ROOT/bin/date"
     fi
     expect_status 42 run --group documents
     if [ "$mail_failure" = missing ]; then
         mv "$TEST_ROOT/sendmail.saved" "$TEST_ROOT/bin/sendmail"
         assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'missing MTA was invoked'
         grep -Fq 'sendmail is unavailable' "$TEST_ROOT/result.log" || fail 'missing absent-MTA log'
+    elif [ "$mail_failure" = prepare ]; then
+        rm "$TEST_ROOT/bin/date"
+        assert_eq 0 "$(cat "$TEST_ROOT/mail-count")" 'email preparation failure invoked sendmail'
+        grep -Fq 'could not prepare email timestamp' "$TEST_ROOT/result.log" || fail 'missing email preparation failure log'
     else
         assert_eq 1 "$(cat "$TEST_ROOT/mail-count")" 'email failure caused retries'
         grep -Fq 'sendmail submission failed' "$TEST_ROOT/result.log" || fail 'missing failed-MTA log'
