@@ -1,0 +1,17 @@
+{
+  "name": "PW Backup (Debian 13)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+  "runArgs": ["--security-opt=seccomp=unconfined"],
+  "mounts": [
+    "source=pw-backup-codex-home,target=/home/vscode/.codex,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": ["openai.chatgpt"]
+    }
+  }
+}
