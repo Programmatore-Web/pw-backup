@@ -125,6 +125,9 @@ grep -Fqx 'stop pw-backup@documents.service' "$SYSTEMCTL_LOG" || fail 'on-disk g
 grep -Fqx 'stop pw-backup@active.service' "$SYSTEMCTL_LOG" || fail 'active group instance was not stopped'
 grep -Fqx 'disable --now pw-backup@active.timer' "$SYSTEMCTL_LOG" || fail 'active group timer was not disabled'
 grep -Fqx 'disable --now pw-backup@disabled.timer' "$SYSTEMCTL_LOG" || fail 'disabled group instance was not handled'
+last_timer_stop=$(awk '/^disable --now / {line=NR} END {print line}' "$SYSTEMCTL_LOG")
+first_service_stop=$(awk '/^stop / {print NR; exit}' "$SYSTEMCTL_LOG")
+[ "$last_timer_stop" -lt "$first_service_stop" ] || fail 'services stopped before all timers were disabled'
 command -v restic >/dev/null 2>&1 || fail 'restic package was unexpectedly removed'
 
 ./install.sh > "$TEST_ROOT/reinstall.log"

@@ -50,15 +50,21 @@ group_units=$(
 for unit in $group_units; do
     case "$unit" in
         *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;;
-        *.service)
-            systemctl stop "$unit" >/dev/null 2>&1 || true
-            systemctl disable "$unit" >/dev/null 2>&1 || true
-            ;;
     esac
 done
 
 for unit in pw-backup.timer pw-backup-maintenance.timer; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
+done
+# Stop every timer before services so an instance cannot be triggered again
+# while its service and files are being removed.
+for unit in $group_units; do
+    case "$unit" in
+        *.service)
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            ;;
+    esac
 done
 for unit in pw-backup.service pw-backup-maintenance.service; do
     systemctl stop "$unit" >/dev/null 2>&1 || true
