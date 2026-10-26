@@ -4,6 +4,10 @@ PW Backup is a minimal installer for scheduled Restic backups on Debian systems.
 
 PW Backup is independent and is not affiliated with Restic or Debian.
 
+The published stable release is **v0.2.0**. This branch prepares **v0.3.0-rc.1**; the candidate is not yet tagged or published.
+
+The candidate adds independent backup groups and schedules, host/tag-scoped retention and coordinated prune, a shared local lock, group PRE/POST hooks with persistent recovery, and optional email alerts.
+
 ## Scope
 
 - Debian with systemd
@@ -267,7 +271,7 @@ sudo ./tests/run.sh
 sudo ./tests/uninstall.sh
 ```
 
-Legacy commands, configuration paths and version identifiers remain unchanged in this development phase. Group selection is optional; no groups are created or enabled automatically.
+Legacy commands and configuration paths remain compatible with v0.2.0. Group selection is optional; no groups are created or enabled automatically.
 
 ## License
 

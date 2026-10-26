@@ -45,8 +45,8 @@ PATH="$TEST_ROOT/bin:$ORIGINAL_PATH"
 export PATH
 
 ./install.sh > "$TEST_ROOT/install.log"
-assert_eq '0.2.0' "$(cat /var/lib/pw-backup/installed-version)" 'installed version'
-assert_eq 'pw-backup 0.2.0' "$(pw-backup --version)" 'runner version'
+assert_eq '0.3.0-rc.1' "$(cat /var/lib/pw-backup/installed-version)" 'installed version'
+assert_eq 'pw-backup 0.3.0-rc.1' "$(pw-backup --version)" 'runner version'
 for path in \
     /etc/systemd/system/pw-backup.service \
     /etc/systemd/system/pw-backup.timer \

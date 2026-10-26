@@ -107,7 +107,7 @@ mv "$TEST_ROOT/group-config.original" "$CONFIG_ROOT/groups/documents/config.env"
 
 pw restic --group documents init
 assert_eq '[]' "$(pw restic snapshots --json | jq -c 'map(.id)')" 'passthrough JSON output'
-assert_eq 'pw-backup 0.2.0' "$(pw --version)" 'runner version unchanged'
+assert_eq 'pw-backup 0.3.0-rc.1' "$(pw --version)" 'runner version'
 pw --help | grep -Fq 'run [--group <name>]' || fail 'missing group help'
 
 # The shell expression is deliberately literal input, never evaluated.
