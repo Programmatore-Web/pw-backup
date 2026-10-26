@@ -59,36 +59,59 @@ fi
 
 # Include running, disabled, and enabled-on-disk instances. Do not pass wildcards
 # to systemctl disable: they are not expanded there like list-units patterns.
-group_units=$(
-    {
-        systemctl list-units --all --plain --no-legend --no-pager 'pw-backup@*.service' 'pw-backup@*.timer' || true
-        systemctl list-unit-files --no-legend --no-pager 'pw-backup@*.service' 'pw-backup@*.timer' || true
-        find /etc/systemd/system \( -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \) -printf '%f\n'
-    } | awk '$1 ~ /^pw-backup@[a-z0-9][a-z0-9_-]*\.(service|timer)$/ {print $1}' | sort -u
-)
-for unit in $group_units; do
-    case "$unit" in
-        *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;;
-    esac
-done
+listed_units=$(systemctl list-units --all --plain --full --no-legend --no-pager \
+    'pw-backup@*.service' 'pw-backup@*.timer') || fail 'cannot list group units; uninstall refused'
+listed_files=$(systemctl list-unit-files --full --no-legend --no-pager \
+    'pw-backup@*.service' 'pw-backup@*.timer') || fail 'cannot list group unit files; uninstall refused'
+disk_units=$(find /etc/systemd/system \( -name 'pw-backup@*.service' -o -name 'pw-backup@*.timer' \) \
+    -printf '%f\n') || fail 'cannot inspect group unit files; uninstall refused'
+group_units=$(printf '%s\n' "$listed_units" "$listed_files" "$disk_units" | \
+    awk '$1 ~ /^pw-backup@[a-z0-9][a-z0-9_-]*\.(service|timer)$/ {print $1}' | sort -u)
+all_units="$group_units
+pw-backup.timer pw-backup-maintenance.timer
+pw-backup.service pw-backup-maintenance.service pw-backup-recover.service"
 
-for unit in pw-backup.timer pw-backup-maintenance.timer; do
-    systemctl disable --now "$unit" >/dev/null 2>&1 || true
-done
-# Stop every timer before services so an instance cannot be triggered again
-# while its service and files are being removed.
-for unit in $group_units; do
-    case "$unit" in
-        *.service)
-            systemctl stop "$unit" >/dev/null 2>&1 || true
-            systemctl disable "$unit" >/dev/null 2>&1 || true
-            ;;
+read_unit_state() {
+    unit_state=$(systemctl show "$1" --property=LoadState --property=ActiveState) || \
+        fail "cannot verify systemd state for $1; uninstall refused"
+    unit_load_state=$(printf '%s\n' "$unit_state" | sed -n 's/^LoadState=//p')
+    unit_active_state=$(printf '%s\n' "$unit_state" | sed -n 's/^ActiveState=//p')
+    case "$unit_load_state" in
+        loaded|masked) [ -n "$unit_active_state" ] || fail "missing active state for $1; uninstall refused" ;;
+        not-found) [ "$unit_active_state" = inactive ] || fail "unresolved systemd state for $1; uninstall refused" ;;
+        *) fail "invalid load state for $1; uninstall refused" ;;
     esac
+}
+
+# Stop every timer before services. Do not remove enablement links or installed
+# files until all stops have succeeded and systemd confirms quiescent states.
+present_units=
+for unit_type in timer service; do
+    for unit in $all_units; do
+        case "$unit" in
+            *."$unit_type")
+                read_unit_state "$unit"
+                [ "$unit_load_state" != not-found ] || continue
+                systemctl stop "$unit" || fail "could not stop $unit; uninstall refused"
+                present_units="$present_units $unit"
+                ;;
+        esac
+    done
 done
-for unit in pw-backup.service pw-backup-maintenance.service pw-backup-recover.service; do
-    systemctl stop "$unit" >/dev/null 2>&1 || true
-    systemctl disable "$unit" >/dev/null 2>&1 || true
+verify_stopped_units() {
+    for unit in $all_units; do
+        read_unit_state "$unit"
+        case "$unit_active_state" in
+            inactive|failed) ;;
+            *) fail "$unit is not stopped (state: $unit_active_state); uninstall refused" ;;
+        esac
+    done
+}
+verify_stopped_units
+for unit in $present_units; do
+    systemctl disable "$unit" || fail "could not disable $unit; uninstall refused"
 done
+verify_stopped_units
 
 rm -f "$BIN_PATH"
 for unit in \
